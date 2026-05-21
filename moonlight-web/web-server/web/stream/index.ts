@@ -115,6 +115,10 @@ export class Stream {
     private audioDecoderReady: boolean = false
     private nextAudioTime: number = 0
     private sourceNodes: Set<AudioBufferSourceNode> = new Set()
+    // Pool of reusable AudioBuffers; since all audio chunks have the same length
+    // (fixed samples_per_frame from stream config) we can safely recycle them
+    // after their source node has finished playing, eliminating per-chunk allocations.
+    private audioBufferPool: AudioBuffer[] = []
     private isFirstAudioPacket: boolean = true
     private audioPacketsReceived: number = 0
     private audioPacketsDecoded: number = 0
@@ -137,7 +141,7 @@ export class Stream {
         this.appId = appId
 
         this.settings = settings
-        this.audioDecodeWorkerAllowed = settings.useWorkers
+        this.audioDecodeWorkerAllowed = settings.useAudioWorker
 
         this.streamerSize = getStreamerSize(settings, viewerScreenSize)
 
@@ -419,7 +423,7 @@ export class Stream {
 
         const channels = 2;
         const frameCount = left.length;
-        const audioBuffer = this.audioContext.createBuffer(channels, frameCount, 48000);
+        const audioBuffer = this.acquireAudioBuffer(channels, frameCount, 48000);
 
         audioBuffer.copyToChannel(left, 0);
         audioBuffer.copyToChannel(right, 1);
@@ -447,6 +451,7 @@ export class Stream {
         this.sourceNodes.add(source);
         source.onended = () => {
             this.sourceNodes.delete(source);
+            this.releaseAudioBuffer(audioBuffer);
         };
 
         // Guard against sourceNodes leak if onended doesn't fire (constrained browsers)
@@ -459,6 +464,20 @@ export class Stream {
                     this.audioDroppedCleanupSources++;
                 }
             }
+        }
+    }
+
+    private acquireAudioBuffer(channels: number, frameCount: number, sampleRate: number): AudioBuffer {
+        const buf = this.audioBufferPool.pop()
+        if (buf && buf.numberOfChannels === channels && buf.length === frameCount) {
+            return buf
+        }
+        return this.audioContext!.createBuffer(channels, frameCount, sampleRate)
+    }
+
+    private releaseAudioBuffer(buf: AudioBuffer) {
+        if (this.audioBufferPool.length < 16) {
+            this.audioBufferPool.push(buf)
         }
     }
 
@@ -689,9 +708,11 @@ export class Stream {
 
     // -- Track and Data Channels
     private onTrack(event: RTCTrackEvent) {
-        // Optimize jitter buffer for Tesla (cellular)
-        // 0ms is ideal for LAN, but ~20-30ms helps smooth out cellular jitter without killing feel
-        const targetDelay = 0;
+        // Jitter buffer target: balance between smoothness and latency.
+        // 0ms = minimum latency but network jitter directly causes frame timing variance (judder).
+        // 10ms = smooths out WiFi jitter (~5-15ms variance) while adding imperceptible latency.
+        // The browser uses this as a TARGET not a minimum — it can still deliver faster when possible.
+        const targetDelay = 20;
         
         event.receiver.jitterBufferTarget = targetDelay;
 

@@ -24,7 +24,8 @@ export type StreamSettings = {
     toggleFullscreenWithKeybind: boolean,
     stretchToFit: boolean,
     showStreamStats: boolean,
-    useWorkers: boolean,
+    useAudioWorker: boolean,
+    useVideoWorker: boolean,
 }
 
 export function defaultStreamSettings(): StreamSettings {
@@ -51,7 +52,8 @@ export function defaultStreamSettings(): StreamSettings {
         toggleFullscreenWithKeybind: false,
         stretchToFit: true,
         showStreamStats: false,
-        useWorkers: true,
+        useAudioWorker: true,
+        useVideoWorker: false,
     }
 }
 
@@ -107,7 +109,8 @@ export class StreamSettingsComponent implements Component {
     private toggleFullscreenWithKeybind: InputComponent
     private stretchToFit: InputComponent
     private showStreamStats: InputComponent
-    private useWorkers: InputComponent
+    private useAudioWorker: InputComponent
+    private useVideoWorker: InputComponent
 
     constructor(settings?: StreamSettings) {
         const defaultSettings = defaultStreamSettings()
@@ -288,12 +291,18 @@ export class StreamSettingsComponent implements Component {
         this.canvasRenderer.addChangeListener(this.onSettingsChange.bind(this))
         this.canvasRenderer.mount(advancedSection)
 
-        // Worker acceleration toggle
-        this.useWorkers = new InputComponent("useWorkers", "checkbox", "Use Worker Acceleration (Audio Decode + Video Render)", {
-            checked: settings?.useWorkers ?? defaultSettings.useWorkers
+        // Worker acceleration toggles
+        this.useAudioWorker = new InputComponent("useAudioWorker", "checkbox", "Audio Decode Worker", {
+            checked: settings?.useAudioWorker ?? defaultSettings.useAudioWorker
         })
-        this.useWorkers.addChangeListener(this.onSettingsChange.bind(this))
-        this.useWorkers.mount(advancedSection)
+        this.useAudioWorker.addChangeListener(this.onSettingsChange.bind(this))
+        this.useAudioWorker.mount(advancedSection)
+
+        this.useVideoWorker = new InputComponent("useVideoWorker", "checkbox", "Video Render Worker (OffscreenCanvas)", {
+            checked: settings?.useVideoWorker ?? defaultSettings.useVideoWorker
+        })
+        this.useVideoWorker.addChangeListener(this.onSettingsChange.bind(this))
+        this.useVideoWorker.mount(advancedSection)
 
         // Stretch to fit
         this.stretchToFit = new InputComponent("stretchToFit", "checkbox", "Stretch image to fit window (Canvas Renderer Only)", {
@@ -364,7 +373,8 @@ export class StreamSettingsComponent implements Component {
         settings.toggleFullscreenWithKeybind = this.toggleFullscreenWithKeybind.isChecked()
         settings.stretchToFit = this.stretchToFit.isChecked()
         settings.showStreamStats = this.showStreamStats.isChecked()
-        settings.useWorkers = this.useWorkers.isChecked()
+        settings.useAudioWorker = this.useAudioWorker.isChecked()
+        settings.useVideoWorker = this.useVideoWorker.isChecked()
 
         return settings
     }

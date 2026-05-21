@@ -13,6 +13,13 @@ type WorkerDiagnosticsSnapshot = {
         active: boolean
         hasWorkerInstance: boolean
         error: string | null
+        rafMissedFrames: number
+        drawnFrameCount: number
+        arrivedCount: number
+        minGapMs: number
+        avgGapMs: number
+        maxGapMs: number
+        videoElementMode?: boolean
     } | null
     canvasRendererEnabled: boolean
     workersAllowedBySettings: boolean
@@ -35,6 +42,9 @@ export class StreamStatsOverlay implements Component {
     private elJitter = document.createElement("span")
     private elDecodeTime = document.createElement("span")
     private elFramesDropped = document.createElement("span")
+    private elNackPli = document.createElement("span")
+    private elFreeze = document.createElement("span")
+    private elAssembly = document.createElement("span")
     private elAudioBitrate = document.createElement("span")
     private elAudioPackets = document.createElement("span")
     private elAudioGap = document.createElement("span")
@@ -53,6 +63,14 @@ export class StreamStatsOverlay implements Component {
     private prevPacketsReceived = 0
     private prevPacketsLost = 0
     private prevAudioMessagesReceived = 0
+    private prevNackCount = 0
+    private prevPliCount = 0
+    private prevKeyFramesDecoded = 0
+    private prevFramesDecoded = 0
+    private prevTotalAssemblyTime = 0
+    private prevFramesAssembled = 0
+    private prevJitterBufferDelay = 0
+    private prevJitterBufferEmittedCount = 0
 
     constructor() {
         this.root.classList.add("stream-stats-overlay")
@@ -67,6 +85,9 @@ export class StreamStatsOverlay implements Component {
             ["Network Jitter", this.elJitter],
             ["Decode Time", this.elDecodeTime],
             ["Frames Dropped", this.elFramesDropped],
+            ["NACK / PLI", this.elNackPli],
+            ["Freeze", this.elFreeze],
+            ["Frame Assembly", this.elAssembly],
             ["Audio Bitrate", this.elAudioBitrate],
             ["Audio Messages", this.elAudioPackets],
             ["Audio Gap", this.elAudioGap],
@@ -149,6 +170,16 @@ export class StreamStatsOverlay implements Component {
         let packetsLost = 0
         let audioBytesReceived = 0
         let audioMessagesReceived = 0
+        let nackCount = 0
+        let pliCount = 0
+        let keyFramesDecoded = 0
+        let freezeCount = 0
+        let totalFreezesDuration = 0
+        let totalAssemblyTime = 0
+        let framesAssembledFromMultiplePackets = 0
+        let jitterBufferDelay = 0
+        let jitterBufferEmittedCount = 0
+        let jitterBufferMinimumDelay = 0
 
         // Collect all reports into a map for two-pass lookups
         const reports: Map<string, any> = new Map()
@@ -168,6 +199,16 @@ export class StreamStatsOverlay implements Component {
                 codecId = report.codecId ?? ""
                 packetsReceived = report.packetsReceived ?? 0
                 packetsLost = report.packetsLost ?? 0
+                nackCount = report.nackCount ?? 0
+                pliCount = report.pliCount ?? 0
+                keyFramesDecoded = report.keyFramesDecoded ?? 0
+                freezeCount = report.freezeCount ?? 0
+                totalFreezesDuration = report.totalFreezesDuration ?? 0
+                totalAssemblyTime = report.totalAssemblyTime ?? 0
+                framesAssembledFromMultiplePackets = report.framesAssembledFromMultiplePackets ?? 0
+                jitterBufferDelay = report.jitterBufferDelay ?? 0
+                jitterBufferEmittedCount = report.jitterBufferEmittedCount ?? 0
+                jitterBufferMinimumDelay = report.jitterBufferMinimumDelay ?? 0
 
                 if (report.frameWidth && report.frameHeight) {
                     videoWidth = report.frameWidth
@@ -212,6 +253,16 @@ export class StreamStatsOverlay implements Component {
             const droppedDelta = framesDropped - this.prevFramesDropped
             this.elFramesDropped.textContent = `${framesDropped} (+${droppedDelta})`
 
+            const nackDelta = nackCount - this.prevNackCount
+            const pliDelta  = pliCount  - this.prevPliCount
+            const keyDelta  = keyFramesDecoded - this.prevKeyFramesDecoded
+            this.elNackPli.textContent = `NACK ${nackDelta}/s, PLI ${pliDelta}/s, keyframes ${keyDelta}/s (${keyFramesDecoded} total)`
+
+            const assembledDelta = framesAssembledFromMultiplePackets - this.prevFramesAssembled
+            const assemblyTimeDelta = totalAssemblyTime - this.prevTotalAssemblyTime
+            const avgAssemblyMs = assembledDelta > 0 ? (assemblyTimeDelta / assembledDelta * 1000) : 0
+            this.elAssembly.textContent = `${assembledDelta}/s multi-pkt, avg ${avgAssemblyMs.toFixed(1)} ms`
+
             const totalPacketsDelta = (packetsReceived - this.prevPacketsReceived) + (packetsLost - this.prevPacketsLost)
             const lostDelta = packetsLost - this.prevPacketsLost
             const lossPercent = totalPacketsDelta > 0 ? (lostDelta / totalPacketsDelta * 100) : 0
@@ -224,12 +275,26 @@ export class StreamStatsOverlay implements Component {
             decodeTime = (totalDecodeTime / framesDecoded) * 1000
         }
 
+        this.elFreeze.textContent = freezeCount > 0
+            ? `${freezeCount} events, ${(totalFreezesDuration * 1000).toFixed(0)} ms total`
+            : `0`
+
         this.elVideoRes.textContent = videoWidth > 0 ? `${videoWidth}×${videoHeight}` : "—"
         this.elCodec.textContent = codec || "—"
         this.elFps.textContent = framesPerSecond > 0 ? `${framesPerSecond}` : "—"
         this.elRtt.textContent = rtt > 0 ? `${(rtt * 1000).toFixed(1)} ms` : "—"
-        this.elJitter.textContent = jitter > 0 ? `${(jitter * 1000).toFixed(1)} ms` : "—"
+
         this.elDecodeTime.textContent = decodeTime > 0 ? `${decodeTime.toFixed(1)} ms` : "—"
+
+        // Jitter buffer delay: avg time each frame waited in the buffer before reaching the decoder.
+        // This is the definitive measure of end-to-end decode latency budget consumed by the jitter buffer.
+        const jbDelayDelta   = jitterBufferDelay        - this.prevJitterBufferDelay
+        const jbEmittedDelta = jitterBufferEmittedCount - this.prevJitterBufferEmittedCount
+        const avgJbDelayMs   = jbEmittedDelta > 0 ? (jbDelayDelta / jbEmittedDelta * 1000) : -1
+        const jbMinMs        = jitterBufferMinimumDelay > 0 ? (jitterBufferMinimumDelay * 1000).toFixed(1) : "?"
+        this.elJitter.textContent = jitter > 0
+            ? `net ${(jitter * 1000).toFixed(1)} ms, buf avg ${avgJbDelayMs >= 0 ? avgJbDelayMs.toFixed(1) : "?"} ms (min ${jbMinMs} ms)`
+            : "\u2014"
 
         const stream = this.streamGetter?.()
         const audioDiag: StreamAudioDiagnostics | null = stream ? stream.getAudioDiagnostics() : null
@@ -255,7 +320,13 @@ export class StreamStatsOverlay implements Component {
 
             if (workerDiag.canvasRendererEnabled) {
                 if (workerDiag.canvas) {
-                    this.elWorkerVideo.textContent = `active=${workerDiag.canvas.active}, attempted=${workerDiag.canvas.attempted}, instance=${workerDiag.canvas.hasWorkerInstance}, err=${workerDiag.canvas.error ?? "none"}`
+                    const c = workerDiag.canvas
+                    const modeLabel = c.videoElementMode ? "vidElem" : (c.active ? "worker" : "main")
+                    const dropLabel = c.active ? "dropped" : "rafMiss"
+                    const gapStr = c.minGapMs >= 0
+                        ? ` gaps: ${c.minGapMs.toFixed(1)}/${c.avgGapMs.toFixed(1)}/${c.maxGapMs.toFixed(1)} ms (min/avg/max)`
+                        : ""
+                    this.elWorkerVideo.textContent = `mode=${modeLabel}, arrived=${c.arrivedCount}/s, drawn=${c.drawnFrameCount}, ${dropLabel}=${c.rafMissedFrames}${gapStr}, err=${c.error ?? "none"}`
                 } else {
                     this.elWorkerVideo.textContent = "canvas diagnostics unavailable"
                 }
@@ -275,6 +346,14 @@ export class StreamStatsOverlay implements Component {
         this.prevPacketsReceived = packetsReceived
         this.prevPacketsLost = packetsLost
         this.prevAudioMessagesReceived = audioMessagesReceived
+        this.prevNackCount = nackCount
+        this.prevPliCount = pliCount
+        this.prevKeyFramesDecoded = keyFramesDecoded
+        this.prevFramesDecoded = framesDecoded
+        this.prevTotalAssemblyTime = totalAssemblyTime
+        this.prevFramesAssembled = framesAssembledFromMultiplePackets
+        this.prevJitterBufferDelay = jitterBufferDelay
+        this.prevJitterBufferEmittedCount = jitterBufferEmittedCount
     }
 
     destroy() {

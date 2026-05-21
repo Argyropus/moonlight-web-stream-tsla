@@ -19,6 +19,15 @@ export class CanvasRenderer {
     private workerInitError: string | null = null
     private stretchToFit: boolean
     private handleResize: () => void
+
+    // Hidden video element renderer: uses browser's native frame timing
+    private hiddenVideo: HTMLVideoElement | null = null
+    private useVideoElementSource: boolean
+    private rafId: number = 0
+    private lastVideoTime: number = -1  // detect new frames via video.currentTime
+    private videoDrawnCount: number = 0
+    private videoNewFrameCount: number = 0  // times we detected a genuinely new frame
+
     constructor(canvasElement: HTMLCanvasElement, stretchToFit: boolean, enableWorkerAcceleration: boolean = true) {
         this.canvas = canvasElement
         this.ctx = null
@@ -29,6 +38,13 @@ export class CanvasRenderer {
         this.latestFrame = null
         this.stretchToFit = stretchToFit
         this.workerAccelerationAllowed = enableWorkerAcceleration
+        // Use hidden video element source by default — it leverages the browser's
+        // native frame timing/smoothing instead of the batchy MediaStreamTrackProcessor pipeline.
+        // Falls back to MSTP if the video element doesn't produce frames.
+        // DISABLED: Tesla kills <video> playback in drive mode, causing black screen.
+        // The MSTP/worker path is the only one that works in drive mode.
+        this.useVideoElementSource = false
+        this.workerAccelerationAllowed = enableWorkerAcceleration
         this.drawLoop = this.drawLoop.bind(this)
         this.handleResize = () => {
             if (!this.canvas) return
@@ -38,6 +54,13 @@ export class CanvasRenderer {
                     width: Math.max(1, this.canvas.clientWidth),
                     height: Math.max(1, this.canvas.clientHeight),
                 })
+                return
+            }
+
+            if (this.useVideoElementSource) {
+                // Reset layout so it recalculates on next draw
+                this.drawWidth = 0
+                this.drawHeight = 0
                 return
             }
 
@@ -77,6 +100,16 @@ export class CanvasRenderer {
         try {
             const offscreen = transfer.call(this.canvas) as OffscreenCanvas
             this.renderWorker = new Worker(new URL("./video_render_worker.js", import.meta.url), { type: "module" })
+            this.renderWorker.onmessage = (event: MessageEvent) => {
+                if (event.data?.type === "stats") {
+                    this.workerDrawnFrameCount   = event.data.drawn
+                    this.workerDroppedFrameCount = event.data.dropped
+                    this.workerArrivedCount      = event.data.arrived
+                    this.workerMinGapMs          = event.data.minGapMs
+                    this.workerAvgGapMs          = event.data.avgGapMs
+                    this.workerMaxGapMs          = event.data.maxGapMs
+                }
+            }
             this.renderWorker.postMessage({
                 type: "init",
                 canvas: offscreen,
@@ -95,12 +128,24 @@ export class CanvasRenderer {
     }
 
     getWorkerDiagnostics() {
+        const isWorkerActive = this.workerRenderingEnabled
+        const isVideoElementActive = this.useVideoElementSource && this.hiddenVideo != null
         return {
             allowed: this.workerAccelerationAllowed,
             attempted: this.workerInitAttempted,
-            active: this.workerRenderingEnabled,
+            active: isWorkerActive,
             hasWorkerInstance: this.renderWorker != null,
             error: this.workerInitError,
+            // In video-element mode report video element stats
+            // In worker mode use counts reported back from the worker;
+            // in main-thread mode use the rAF-loop counters.
+            rafMissedFrames: isWorkerActive ? this.workerDroppedFrameCount : this.rafMissedFrames,
+            drawnFrameCount: isVideoElementActive ? this.videoDrawnCount : (isWorkerActive ? this.workerDrawnFrameCount : this.drawnFrameCount),
+            arrivedCount:    isVideoElementActive ? this.videoNewFrameCount : (isWorkerActive ? this.workerArrivedCount : 0),
+            minGapMs:        isWorkerActive ? this.workerMinGapMs          : -1,
+            avgGapMs:        isWorkerActive ? this.workerAvgGapMs          : -1,
+            maxGapMs:        isWorkerActive ? this.workerMaxGapMs          : -1,
+            videoElementMode: isVideoElementActive,
         }
     }
 
@@ -113,44 +158,202 @@ export class CanvasRenderer {
         this.videoTrack = track
 
         if (this.videoTrack) {
-            if (!("MediaStreamTrackProcessor" in window)) {
-                console.error("MediaStreamTrackProcessor not supported in this browser.")
-                // Fallback or error handling if API is not available
-                return
-            }
-            try {
-                this.trackProcessor = new MediaStreamTrackProcessor({ track: this.videoTrack })
-                this.readableStream = this.trackProcessor.readable
-                this.frameReader = this.readableStream.getReader()
-                this.startRendering()
-            } catch (e) {
-                console.error("Error creating MediaStreamTrackProcessor:", e)
+            if (this.useVideoElementSource) {
+                // Hidden video element approach: attach track to a hidden <video>,
+                // let the browser handle jitter buffer smoothing and frame timing natively,
+                // then draw from the video element to canvas at each rAF.
+                this.setupHiddenVideoElement(this.videoTrack)
+                this.startRenderingFromVideo()
+            } else {
+                // Legacy: MediaStreamTrackProcessor → ReadableStream → Worker/main-thread
+                if (!("MediaStreamTrackProcessor" in window)) {
+                    console.error("MediaStreamTrackProcessor not supported in this browser.")
+                    return
+                }
+                try {
+                    this.trackProcessor = new MediaStreamTrackProcessor({ track: this.videoTrack })
+                    this.readableStream = this.trackProcessor.readable
+                    this.startRendering()
+                } catch (e) {
+                    console.error("Error creating MediaStreamTrackProcessor:", e)
+                }
             }
         }
     }
 
+    private setupHiddenVideoElement(track: MediaStreamTrack) {
+        this.hiddenVideo = document.createElement("video")
+        this.hiddenVideo.style.position = "absolute"
+        this.hiddenVideo.style.width = "1px"
+        this.hiddenVideo.style.height = "1px"
+        this.hiddenVideo.style.opacity = "0"
+        this.hiddenVideo.style.pointerEvents = "none"
+        this.hiddenVideo.muted = true
+        this.hiddenVideo.autoplay = true
+        this.hiddenVideo.playsInline = true
+        this.hiddenVideo.srcObject = new MediaStream([track])
+        // Append to DOM so the browser actually decodes frames
+        document.body.appendChild(this.hiddenVideo)
+        this.hiddenVideo.play().catch(e => console.error("Hidden video play failed:", e))
+    }
+
+    private startRenderingFromVideo() {
+        if (!this.canvas || !this.hiddenVideo) return
+        this.ctx = this.canvas.getContext("2d")
+        this.isRunning = true
+        this.lastVideoTime = -1
+        this.videoDrawnCount = 0
+        this.videoNewFrameCount = 0
+
+        // Use requestVideoFrameCallback if available for frame-precise timing,
+        // otherwise fall back to requestAnimationFrame
+        if ("requestVideoFrameCallback" in this.hiddenVideo) {
+            this.videoFrameCallbackLoop()
+        } else {
+            this.videoRafLoop()
+        }
+    }
+
+    private videoFrameCallbackLoop() {
+        if (!this.isRunning || !this.hiddenVideo) return
+        this.hiddenVideo.requestVideoFrameCallback((_now, _metadata) => {
+            this.drawFromVideoElement()
+            this.videoFrameCallbackLoop()
+        })
+    }
+
+    private videoRafLoop() {
+        if (!this.isRunning) return
+        this.rafId = requestAnimationFrame(() => {
+            this.drawFromVideoElement()
+            this.videoRafLoop()
+        })
+    }
+
+    private drawFromVideoElement() {
+        if (!this.ctx || !this.canvas || !this.hiddenVideo) return
+        if (this.hiddenVideo.readyState < 2) return  // HAVE_CURRENT_DATA
+
+        const currentTime = this.hiddenVideo.currentTime
+        if (currentTime === this.lastVideoTime) return  // no new frame
+        this.lastVideoTime = currentTime
+        this.videoNewFrameCount++
+
+        const vw = this.hiddenVideo.videoWidth
+        const vh = this.hiddenVideo.videoHeight
+        if (vw === 0 || vh === 0) return
+
+        // Recalculate layout if needed
+        if (this.drawWidth === 0 || this.drawHeight === 0) {
+            this.recalcLayoutFromDimensions(vw, vh)
+        }
+
+        if (this.offsetX !== 0 || this.offsetY !== 0) {
+            this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height)
+        }
+        this.ctx.drawImage(this.hiddenVideo, this.offsetX, this.offsetY, this.drawWidth, this.drawHeight)
+        this.videoDrawnCount++
+    }
+
+    private recalcLayoutFromDimensions(frameWidth: number, frameHeight: number) {
+        if (!this.canvas) return
+        const canvasAspect = this.canvas.clientWidth / this.canvas.clientHeight
+        const frameAspect = frameWidth / frameHeight
+        this.offsetX = 0
+        this.offsetY = 0
+
+        if (this.stretchToFit) {
+            this.canvas.width = this.canvas.clientWidth
+            this.canvas.height = this.canvas.clientHeight
+            this.drawWidth = this.canvas.width
+            this.drawHeight = this.canvas.height
+        } else {
+            this.canvas.width = frameWidth
+            this.canvas.height = frameHeight
+            if (canvasAspect > frameAspect) {
+                this.drawHeight = this.canvas.height
+                this.drawWidth = this.drawHeight * frameAspect
+                this.offsetX = (this.canvas.width - this.drawWidth) / 2
+            } else {
+                this.drawWidth = this.canvas.width
+                this.drawHeight = this.drawWidth / frameAspect
+                this.offsetY = (this.canvas.height - this.drawHeight) / 2
+            }
+        }
+    }
+
+    // Try to hand the ReadableStream to the worker so it pulls frames directly,
+    // bypassing the main-thread async readLoop entirely. Falls back gracefully if
+    // the browser does not support transferable ReadableStream (Chrome 87+).
+    private tryTransferStreamToWorker(): boolean {
+        if (!this.renderWorker || !this.workerRenderingEnabled || !this.readableStream) {
+            return false
+        }
+        try {
+            this.renderWorker.postMessage(
+                { type: "setStream", stream: this.readableStream },
+                [this.readableStream as any]
+            )
+            this.readableStream = null  // worker now owns it
+            this.workerOwnsStream = true
+            return true
+        } catch (_e) {
+            // Browser doesn't support transferable ReadableStream — fall back to postMessage frames
+            this.workerOwnsStream = false
+            return false
+        }
+    }
+
     startRendering() {
-        if (this.frameReader && !this.isRunning) {
+        if ((this.readableStream || this.frameReader) && !this.isRunning) {
             this.trySetupRenderWorker()
             if (!this.workerRenderingEnabled && this.canvas && !this.ctx) {
                 this.ctx = this.canvas.getContext("2d")
             }
             this.isRunning = true
-            this.readLoop()
-            if (!this.workerRenderingEnabled) {
-                requestAnimationFrame(this.drawLoop)
+            if (this.workerRenderingEnabled && this.tryTransferStreamToWorker()) {
+                // Worker owns the ReadableStream and reads frames directly on its own thread.
+                // No main-thread readLoop needed — this is the zero-main-thread-involvement path.
+            } else {
+                // Fallback: main thread reads frames and draws immediately on arrival.
+                // No rAF loop needed — draw-immediately is the same strategy the worker uses.
+                this.workerOwnsStream = false
+                if (!this.frameReader && this.readableStream) {
+                    this.frameReader = this.readableStream.getReader()
+                }
+                this.readLoop()
             }
         }
     }
 
     stopRendering() {
         this.isRunning = false
+        if (this.rafId) {
+            cancelAnimationFrame(this.rafId)
+            this.rafId = 0
+        }
+        if (this.hiddenVideo) {
+            this.hiddenVideo.pause()
+            this.hiddenVideo.srcObject = null
+            this.hiddenVideo.remove()
+            this.hiddenVideo = null
+        }
+        if (this.workerOwnsStream && this.renderWorker) {
+            // Tell the worker to cancel its stream reader
+            this.renderWorker.postMessage({ type: "stopStream" })
+            this.workerOwnsStream = false
+            this.readableStream = null  // worker owns/cancels it
+        }
         if (this.frameReader) {
             this.frameReader.cancel()
             this.frameReader = null
         }
         if (this.trackProcessor) {
-            this.trackProcessor.readable.cancel()
+            // Only cancel the readable if we still hold a reference to it
+            if (this.readableStream) {
+                this.readableStream.cancel().catch(() => {})
+                this.readableStream = null
+            }
             this.trackProcessor = null
         }
         if (this.latestFrame) {
@@ -177,9 +380,11 @@ export class CanvasRenderer {
                     continue
                 }
 
-                const old = this.latestFrame
-                this.latestFrame = value
-                if (old) old.close()
+                // Draw-immediately: render each frame the instant it arrives.
+                // This is the same strategy the worker uses — no rAF needed.
+                // On a 60Hz display, the compositor takes the latest canvas content
+                // at each vsync regardless of when drawImage was called.
+                this.drawFrameImmediate(value)
             }
         } catch (e) {
             console.error("Error reading video frame:", e)
@@ -187,10 +392,39 @@ export class CanvasRenderer {
         }
     }
 
+    private drawFrameImmediate(frame: VideoFrame) {
+        if (!this.ctx || !this.canvas) {
+            frame.close()
+            return
+        }
+
+        if (this.drawWidth === 0) {
+            this.onFirstFrameAfterResize(frame)
+        }
+
+        if (this.offsetX !== 0 || this.offsetY !== 0) {
+            this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height)
+        }
+        this.ctx.drawImage(frame, this.offsetX, this.offsetY, this.drawWidth, this.drawHeight)
+        this.drawnFrameCount++
+        frame.close()
+    }
+
     private offsetX = 0;
     private offsetY = 0;
     private drawWidth = 0;
     private drawHeight = 0;
+    // true when the worker has taken ownership of the ReadableStream via setStream transfer
+    private workerOwnsStream: boolean = false
+    private rafMissedFrames: number = 0;  // rAF ticks with no decoded frame ready (rAF desync indicator)
+    private drawnFrameCount: number = 0;
+    // Stats received from the render worker (worker mode)
+    private workerDrawnFrameCount: number = 0;
+    private workerDroppedFrameCount: number = 0;
+    private workerArrivedCount: number = 0;
+    private workerMinGapMs: number = -1;
+    private workerAvgGapMs: number = -1;
+    private workerMaxGapMs: number = -1;
 
     public onFirstFrameAfterResize(frame: VideoFrame) {
         if(!this.canvas) return
@@ -233,6 +467,8 @@ export class CanvasRenderer {
         requestAnimationFrame(this.drawLoop)
 
         if (!this.ctx || !this.latestFrame || !this.canvas) {
+            // Count ticks where no frame was ready — indicates rAF is running ahead of the decoder
+            if (this.isRunning && this.ctx) this.rafMissedFrames++
             return
         }
 
@@ -248,6 +484,7 @@ export class CanvasRenderer {
             this.ctx.clearRect(0, 0, this.canvas.width, this.canvas.height)
         }
         this.ctx.drawImage(frame, this.offsetX, this.offsetY, this.drawWidth, this.drawHeight)
+        this.drawnFrameCount++
         frame.close() // Close the VideoFrame to release resources
     }
 
@@ -261,6 +498,12 @@ export class CanvasRenderer {
         this.workerRenderingEnabled = false
         if (this.handleResize) {
             window.removeEventListener("resize", this.handleResize)
+        }
+        if (this.hiddenVideo) {
+            this.hiddenVideo.pause()
+            this.hiddenVideo.srcObject = null
+            this.hiddenVideo.remove()
+            this.hiddenVideo = null
         }
         this.canvas = null
         this.ctx = null

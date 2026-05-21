@@ -171,7 +171,7 @@ class ViewerApp implements Component {
         if(this.settings.canvasRenderer) {
             this.canvasElement.classList.add("video-stream")
             this.div.appendChild(this.canvasElement)
-            this.canvasRenderer = new CanvasRenderer(this.canvasElement, settings.stretchToFit, settings.useWorkers)
+            this.canvasRenderer = new CanvasRenderer(this.canvasElement, settings.stretchToFit, settings.useVideoWorker)
             this.videoElement.autoplay = false
         }
 
@@ -355,7 +355,7 @@ class ViewerApp implements Component {
             stream: this.stream?.getWorkerDiagnostics() ?? null,
             canvas: this.canvasRenderer?.getWorkerDiagnostics() ?? null,
             canvasRendererEnabled: this.settings.canvasRenderer,
-            workersAllowedBySettings: this.settings.useWorkers,
+            workersAllowedBySettings: this.settings.useVideoWorker,
         }
     }
 
