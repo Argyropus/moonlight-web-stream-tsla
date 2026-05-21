@@ -9,6 +9,7 @@ use moonlight_common::stream::{
 };
 use ogg::{PacketWriteEndInfo, PacketWriter};
 use tokio::sync::mpsc::{self, Sender, UnboundedSender};
+use tokio::time::{self, Duration};
 use webrtc::{
     api::media_engine::{MIME_TYPE_OPUS, MediaEngine},
     data_channel::RTCDataChannel,
@@ -136,29 +137,83 @@ impl AudioDecoder for OpusTrackSampleAudioDecoder {
                 warn!("Failed to write comment header: {:?}", e);
             }
 
-            // Send headers
+            // Collect initial header chunks and send them together
+            let mut initial_payload = Vec::new();
             while let Ok(chunk) = chunk_rx.try_recv() {
-                if let Err(e) = channel.send(&chunk).await {
+                initial_payload.extend_from_slice(&chunk);
+            }
+            if !initial_payload.is_empty() {
+                if let Err(e) = channel.send(&Bytes::from(initial_payload)).await {
                     warn!("Failed to send Ogg headers: {:?}", e);
                 }
             }
 
-            while let Some(data) = receiver.recv().await {
-                granule_pos += samples_per_frame;
+            // Aggregation buffer for outgoing chunks
+            let mut pending: Vec<Bytes> = Vec::new();
+            // Flush interval (milliseconds) — small latency tradeoff for fewer messages
+            let mut interval = time::interval(Duration::from_millis(10));
 
-                if let Err(e) = writer.write_packet(
-                    data.to_vec(),
-                    serial,
-                    PacketWriteEndInfo::EndPage,
-                    granule_pos,
-                ) {
-                    warn!("Failed to write audio packet: {:?}", e);
-                }
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = interval.tick() => {
+                        if !pending.is_empty() {
+                            // Concatenate pending chunks into one payload
+                            let total_len: usize = pending.iter().map(|b| b.len()).sum();
+                            let mut buf = Vec::with_capacity(total_len);
+                            for b in pending.drain(..) {
+                                buf.extend_from_slice(&b);
+                            }
+                            if let Err(e) = channel.send(&Bytes::from(buf)).await {
+                                warn!("Failed to send aggregated audio data: {:?}", e);
+                            }
+                        }
+                    }
+                    maybe = receiver.recv() => {
+                        match maybe {
+                            Some(data) => {
+                                granule_pos += samples_per_frame;
 
-                while let Ok(chunk) = chunk_rx.try_recv() {
-                    if let Err(e) = channel.send(&chunk).await {
-                        warn!("Failed to send audio data: {:?}", e);
-                        break;
+                                if let Err(e) = writer.write_packet(
+                                    data.to_vec(),
+                                    serial,
+                                    PacketWriteEndInfo::EndPage,
+                                    granule_pos,
+                                ) {
+                                    warn!("Failed to write audio packet: {:?}", e);
+                                }
+
+                                // Drain any chunks produced by writer and append to pending
+                                while let Ok(chunk) = chunk_rx.try_recv() {
+                                    pending.push(chunk);
+                                }
+                                // If pending is large, flush immediately
+                                let pending_bytes: usize = pending.iter().map(|b| b.len()).sum();
+                                if pending_bytes >= 16 * 1024 {
+                                    let mut buf = Vec::with_capacity(pending_bytes);
+                                    for b in pending.drain(..) {
+                                        buf.extend_from_slice(&b);
+                                    }
+                                    if let Err(e) = channel.send(&Bytes::from(buf)).await {
+                                        warn!("Failed to send aggregated audio data (eager flush): {:?}", e);
+                                    }
+                                }
+                            }
+                            None => {
+                                // Receiver closed — flush any pending and exit
+                                if !pending.is_empty() {
+                                    let total_len: usize = pending.iter().map(|b| b.len()).sum();
+                                    let mut buf = Vec::with_capacity(total_len);
+                                    for b in pending.drain(..) {
+                                        buf.extend_from_slice(&b);
+                                    }
+                                    if let Err(e) = channel.send(&Bytes::from(buf)).await {
+                                        warn!("Failed to send final aggregated audio data: {:?}", e);
+                                    }
+                                }
+                                break;
+                            }
+                        }
                     }
                 }
             }
