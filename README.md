@@ -38,7 +38,7 @@ It hosts Web Server which will forward [Sunshine](https://docs.lizardbyte.dev/pr
 
 ## Installation
 
-1. Install [Sunshine](https://github.com/LizardByte/Sunshine/blob/v2025.628.4510/docs/getting_started.md)
+1. Install [Sunshine](http://github.com/LizardByte/Sunshine/releases/tag/v2026.516.143833)
 
 2. Download the [compressed archive](https://www.patreon.com/posts/windows-linux-158842535) for your platform and uncompress it or [build it yourself](#building)
 
