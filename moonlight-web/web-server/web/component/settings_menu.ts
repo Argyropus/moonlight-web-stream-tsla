@@ -1,7 +1,10 @@
+import { Api, apiDisableTotp, apiEnableTotp, apiGetAuthInfo, apiGetTotpSetup, AuthInfo, logout } from "../api.js";
 import { ControllerConfig } from "../stream/gamepad.js";
 import { MouseScrollMode } from "../stream/input.js";
 import { Component, ComponentEvent } from "./index.js";
 import { InputComponent, SelectComponent } from "./input.js";
+import { showMessage, showModal } from "./modal/index.js";
+import { FormModal } from "./modal/form.js";
 import { SidebarEdge } from "./sidebar/index.js";
 
 export type StreamSettings = {
@@ -85,6 +88,10 @@ export type StreamSettingsChangeListener = (event: ComponentEvent<StreamSettings
 export class StreamSettingsComponent implements Component {
 
     private divElement: HTMLDivElement = document.createElement("div")
+    private securityStatusText: HTMLSpanElement = document.createElement("span")
+    private setupTotpButton: HTMLButtonElement = document.createElement("button")
+    private disableTotpButton: HTMLButtonElement = document.createElement("button")
+    private logoutButton: HTMLButtonElement = document.createElement("button")
 
     private sidebarEdge: SelectComponent
 
@@ -115,7 +122,7 @@ export class StreamSettingsComponent implements Component {
     private useAudioWorker: InputComponent
     private useVideoWorker: InputComponent
 
-    constructor(settings?: StreamSettings) {
+    constructor(settings?: StreamSettings, api?: Api) {
         const defaultSettings = defaultStreamSettings()
 
         // Root div
@@ -341,7 +348,88 @@ export class StreamSettingsComponent implements Component {
         this.showStreamStats.addChangeListener(this.onSettingsChange.bind(this))
         this.showStreamStats.mount(advancedSection)
 
+        // --- Security Settings ---
+        if (api) {
+            const securitySection = createSection("Security")
+
+            this.securityStatusText.innerText = "Loading 2FA status…"
+            securitySection.appendChild(this.securityStatusText)
+
+            this.setupTotpButton.innerText = "Set Up Two-Factor Authentication"
+            this.setupTotpButton.style.display = "none"
+            this.setupTotpButton.addEventListener("click", () => this.handleTotpSetup(api))
+            securitySection.appendChild(this.setupTotpButton)
+
+            this.disableTotpButton.innerText = "Disable Two-Factor Authentication"
+            this.disableTotpButton.style.display = "none"
+            this.disableTotpButton.addEventListener("click", () => this.handleTotpDisable(api))
+            securitySection.appendChild(this.disableTotpButton)
+
+            const logoutSep = document.createElement("hr")
+            logoutSep.style.cssText = "border-color:rgba(255,255,255,0.15);margin:12px 0;"
+            securitySection.appendChild(logoutSep)
+
+            this.logoutButton.innerText = "Log Out"
+            this.logoutButton.style.background = "rgba(180,40,40,0.8)"
+            this.logoutButton.addEventListener("click", () => {
+                logout()
+                location.reload()
+            })
+            securitySection.appendChild(this.logoutButton)
+
+            // Load current 2FA status asynchronously
+            apiGetAuthInfo(api).then(info => this.updateTotpStatus(info))
+        }
+
         this.onSettingsChange()
+    }
+
+    private updateTotpStatus(info: AuthInfo | null) {
+        if (!info || !info.credential_authentication_enabled) {
+            this.securityStatusText.innerText = "Authentication is disabled in config."
+            return
+        }
+        if (info.totp_enabled) {
+            this.securityStatusText.innerText = "Two-Factor Authentication: Enabled ✓"
+            this.setupTotpButton.style.display = "none"
+            this.disableTotpButton.style.display = ""
+        } else {
+            this.securityStatusText.innerText = "Two-Factor Authentication: Disabled"
+            this.setupTotpButton.style.display = ""
+            this.disableTotpButton.style.display = "none"
+        }
+    }
+
+    private async handleTotpSetup(api: Api) {
+        const setupData = await apiGetTotpSetup(api)
+        if (!setupData) {
+            await showMessage("Failed to retrieve 2FA setup data from server.")
+            return
+        }
+
+        const confirmModal = new TotpSetupModal(setupData.secret, setupData.uri)
+        const code = await showModal(confirmModal)
+        if (!code) return
+
+        const result = await apiEnableTotp(api, code)
+        if (result === "invalid_code") {
+            await showMessage("Invalid code — 2FA was NOT enabled. Try again.")
+        } else if (result === "error") {
+            await showMessage("Server error — could not enable 2FA.")
+        } else {
+            await showMessage("Two-Factor Authentication has been enabled.")
+            this.updateTotpStatus({ totp_enabled: true, credential_authentication_enabled: true })
+        }
+    }
+
+    private async handleTotpDisable(api: Api) {
+        const ok = await apiDisableTotp(api)
+        if (ok) {
+            await showMessage("Two-Factor Authentication has been disabled.")
+            this.updateTotpStatus({ totp_enabled: false, credential_authentication_enabled: true })
+        } else {
+            await showMessage("Failed to disable 2FA.")
+        }
     }
 
     private onSettingsChange() {
@@ -402,5 +490,64 @@ export class StreamSettingsComponent implements Component {
     }
     unmount(parent: HTMLElement): void {
         parent.removeChild(this.divElement)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TotpSetupModal — shown during 2FA setup to display the secret and confirm
+// ---------------------------------------------------------------------------
+
+class TotpSetupModal extends FormModal<string> {
+    private codeInput: InputComponent
+
+    private _secret: string
+    private _uri: string
+
+    constructor(secret: string, uri: string) {
+        super()
+        this._secret = secret
+        this._uri = uri
+        this.codeInput = new InputComponent("ml-totp-setup-code", "text", "Verification Code", {
+            inputMode: "numeric",
+        })
+    }
+
+    reset(): void {
+        this.codeInput.reset()
+    }
+
+    submit(): string | null {
+        return this.codeInput.getValue() || null
+    }
+
+    mountForm(form: HTMLFormElement): void {
+        const title = document.createElement("h3")
+        title.innerText = "Set Up Two-Factor Authentication"
+
+        const instructions = document.createElement("p")
+        instructions.innerText =
+            "Enter the secret key below into your authenticator app (Google Authenticator, " +
+            "Authy, etc.) using the 'Enter setup key' option. Then type the 6-digit code to confirm."
+
+        const keyLabel = document.createElement("p")
+        keyLabel.innerHTML = "<strong>Secret key (base32):</strong>"
+
+        const keyDisplay = document.createElement("code")
+        keyDisplay.style.cssText =
+            "display:block;word-break:break-all;user-select:all;padding:6px;" +
+            "background:rgba(0,0,0,0.3);border-radius:4px;margin-bottom:8px;"
+        keyDisplay.innerText = this._secret
+
+        const uriNote = document.createElement("p")
+        uriNote.style.fontSize = "0.8em"
+        uriNote.style.opacity = "0.7"
+        uriNote.innerText = "Algorithm: SHA1 · Digits: 6 · Period: 30 s"
+
+        form.appendChild(title)
+        form.appendChild(instructions)
+        form.appendChild(keyLabel)
+        form.appendChild(keyDisplay)
+        form.appendChild(uriNote)
+        this.codeInput.mount(form)
     }
 }

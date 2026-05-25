@@ -79,7 +79,13 @@ pub async fn start_host(
             return;
         };
 
-        if !credentials.authenticate_with_credentials(request_credentials.as_deref()) {
+        let authenticated = credentials.authenticate_with_credentials(request_credentials.as_deref())
+            || match request_credentials.as_deref() {
+                Some(token) => credentials.validate_session(token).await,
+                None => false,
+            };
+
+        if !authenticated {
             let _ = send_ws_message(
                 &mut session,
                 StreamServerMessage::StageFailed {

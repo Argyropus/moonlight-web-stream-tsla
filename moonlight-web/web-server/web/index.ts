@@ -107,7 +107,7 @@ class MainApp implements Component {
         this.hostList = new HostList(api)
         this.hostList.addHostOpenListener(this.onHostOpen.bind(this))
 
-        this.settings = new StreamSettingsComponent(getLocalStreamSettings() ?? undefined)
+        this.settings = new StreamSettingsComponent(getLocalStreamSettings() ?? undefined, api)
         this.settings.addChangeListener(this.onSettingsChange.bind(this))
 
         this.setCurrentDisplay("hosts")

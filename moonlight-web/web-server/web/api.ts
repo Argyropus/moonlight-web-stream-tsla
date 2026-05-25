@@ -8,6 +8,118 @@ import { buildUrl, isCredentialAuthenticationEnabled } from "./config_.js";
 // IMPORTANT: this should be a bit bigger than the moonlight-common reqwest backend timeout if some hosts are offline!
 const API_TIMEOUT = 6000
 
+/** Sessions persist for 90 days in localStorage. */
+const SESSION_DURATION_MS = 90 * 24 * 60 * 60 * 1000
+const SESSION_STORAGE_KEY = "mlSession"
+
+type StoredSession = { token: string; expires_at_ms: number }
+
+function getStoredSession(): StoredSession | null {
+    try {
+        const raw = localStorage.getItem(SESSION_STORAGE_KEY)
+        if (!raw) return null
+        const session = JSON.parse(raw) as StoredSession
+        if (session.expires_at_ms <= Date.now()) {
+            localStorage.removeItem(SESSION_STORAGE_KEY)
+            return null
+        }
+        return session
+    } catch {
+        localStorage.removeItem(SESSION_STORAGE_KEY)
+        return null
+    }
+}
+
+function storeSession(token: string, expires_at_ms: number) {
+    localStorage.setItem(SESSION_STORAGE_KEY, JSON.stringify({ token, expires_at_ms } satisfies StoredSession))
+}
+
+// ---------------------------------------------------------------------------
+// Login API helpers
+// ---------------------------------------------------------------------------
+
+type LoginResult =
+    | { session_token: string; expires_at_ms: number }
+    | { requires_totp: boolean }
+    | { error: "invalid_credentials" | "server_error" }
+
+async function postLogin(
+    host_url: string,
+    password: string,
+    totp_code?: string,
+): Promise<LoginResult> {
+    try {
+        const body: Record<string, string> = { password }
+        if (totp_code) body["totp_code"] = totp_code
+
+        const response = await fetch(`${host_url}/auth/login`, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(API_TIMEOUT),
+        })
+
+        if (response.status === 401) return { error: "invalid_credentials" }
+        if (!response.ok) return { error: "server_error" }
+
+        return await response.json() as LoginResult
+    } catch {
+        return { error: "server_error" }
+    }
+}
+
+export type AuthInfo = { totp_enabled: boolean; credential_authentication_enabled: boolean }
+
+export async function apiGetAuthInfo(api: Api): Promise<AuthInfo | null> {
+    try {
+        const response = await fetch(`${api.host_url}/auth/info`, {
+            signal: AbortSignal.timeout(API_TIMEOUT),
+        })
+        if (!response.ok) return null
+        return await response.json() as AuthInfo
+    } catch {
+        return null
+    }
+}
+
+export async function apiGetTotpSetup(api: Api): Promise<{ secret: string; uri: string } | null> {
+    try {
+        return await fetchApi(api, "/auth/totp/setup", "get")
+    } catch {
+        return null
+    }
+}
+
+export async function apiEnableTotp(api: Api, code: string): Promise<"ok" | "invalid_code" | "error"> {
+    try {
+        const response = await fetchApi(api, "/auth/totp/enable", "post", {
+            json: { code },
+            response: "ignore",
+        }) as Response
+        if (response.status === 400) return "invalid_code"
+        return "ok"
+    } catch (e) {
+        if (e instanceof FetchError) {
+            const r = e.getResponse()
+            if (r && r.status === 400) return "invalid_code"
+        }
+        return "error"
+    }
+}
+
+export async function apiDisableTotp(api: Api): Promise<boolean> {
+    try {
+        await fetchApi(api, "/auth/totp", "delete", { response: "ignore" })
+        return true
+    } catch {
+        return false
+    }
+}
+
+// ---------------------------------------------------------------------------
+// getApi — main entry point
+// ---------------------------------------------------------------------------
+
 let currentApi: Api | null = null
 
 export async function getApi(host_url?: string): Promise<Api> {
@@ -19,99 +131,139 @@ export async function getApi(host_url?: string): Promise<Api> {
         host_url = buildUrl("/api")
     }
 
-    let credentials = sessionStorage.getItem("mlCredentials");
-
-    if (isCredentialAuthenticationEnabled()) {
-        while (credentials == null) {
-            const prompt = new ApiCredentialsPrompt()
-            const testCredentials = await showModal(prompt)
-
-            if (testCredentials == null) {
-                continue;
-            }
-
-            let api = { host_url, credentials: testCredentials }
-
-            if (await apiAuthenticate(api)) {
-                sessionStorage.setItem("mlCredentials", testCredentials)
-
-                credentials = api.credentials;
-
-                break;
-            } else {
-                await showMessage("Credentials are not Valid")
-            }
-        }
-    } else {
-        credentials = null
+    if (!isCredentialAuthenticationEnabled()) {
+        currentApi = { host_url, credentials: null }
+        return currentApi
     }
 
-    currentApi = { host_url, credentials }
+    // Try to reuse a stored session
+    const stored = getStoredSession()
+    if (stored) {
+        const candidate: Api = { host_url, credentials: stored.token }
+        if (await apiAuthenticate(candidate)) {
+            currentApi = candidate
+            return currentApi
+        }
+        // Token rejected — server may have restarted; clear and re-login
+        localStorage.removeItem(SESSION_STORAGE_KEY)
+    }
 
-    return currentApi
+    // Interactive login loop
+    while (true) {
+        const loginModal = new LoginModal()
+        const creds = await showModal(loginModal)
+
+        if (creds == null) {
+            // User cancelled; keep showing the modal
+            continue
+        }
+
+        const { password, totp_code } = creds
+
+        // Step 1: password (+ optional TOTP if user already entered one)
+        let result = await postLogin(host_url, password, totp_code || undefined)
+
+        if ("error" in result) {
+            if (result.error === "invalid_credentials") {
+                await showMessage("Invalid credentials")
+            } else {
+                await showMessage("Server error — could not log in")
+            }
+            continue
+        }
+
+        // Server needs TOTP code
+        if ("requires_totp" in result && result.requires_totp) {
+            const totpModal = new TotpModal()
+            const code = await showModal(totpModal)
+            if (code == null) continue
+
+            result = await postLogin(host_url, password, code)
+
+            if ("error" in result) {
+                if (result.error === "invalid_credentials") {
+                    await showMessage("Invalid authenticator code")
+                } else {
+                    await showMessage("Server error — could not log in")
+                }
+                continue
+            }
+        }
+
+        if ("session_token" in result) {
+            storeSession(result.session_token, result.expires_at_ms)
+            currentApi = { host_url, credentials: result.session_token }
+            return currentApi
+        }
+    }
 }
 
-class ApiCredentialsPrompt extends FormModal<string> {
+// ---------------------------------------------------------------------------
+// Login modal — password field (+ optional inline TOTP field)
+// ---------------------------------------------------------------------------
 
-    private text: HTMLElement = document.createElement("h3")
-    private credentials: InputComponent
-    private credentialsFile: InputComponent
+class LoginModal extends FormModal<{ password: string; totp_code: string }> {
+    private passwordInput: InputComponent
+    private totpInput: InputComponent
 
     constructor() {
         super()
-
-        this.text.innerText = "Enter Credentials"
-
-        this.credentials = new InputComponent("ml-api-credentials", "password", "Credentials")
-
-        this.credentialsFile = new InputComponent("ml-api-credentials-file", "file", "Credentials as File", { accept: ".txt" })
-    }
-
-    reset(): void {
-        this.credentials.reset()
-    }
-    submit(): string | null {
-        return this.credentials.getValue()
-    }
-
-    onFinish(abort: AbortSignal): Promise<string | null> {
-        const abortController = new AbortController()
-        abort.addEventListener("abort", abortController.abort.bind(abortController))
-
-        return new Promise((resolve, reject) => {
-            this.credentialsFile.addChangeListener(() => {
-                const files = this.credentialsFile.getFiles()
-                if (files && files.length >= 1) {
-                    const file = files[0]
-
-                    file.text().then((credentials) => {
-                        abortController.abort()
-
-                        // Remove carriage return and new line
-                        resolve(
-                            credentials
-                                .replace(/\r/g, "")
-                                .replace(/\n/g, "")
-                        )
-                    })
-                }
-            }, { signal: abortController.signal })
-
-            super.onFinish(abortController.signal).then((data) => {
-                abortController.abort()
-                resolve(data)
-            }, (data) => {
-                abortController.abort()
-                reject(data)
-            })
+        this.passwordInput = new InputComponent("ml-login-password", "password", "Password")
+        this.totpInput = new InputComponent("ml-login-totp", "text", "2FA Code (if enabled)", {
+            inputMode: "numeric",
         })
     }
 
-    mountForm(form: HTMLFormElement): void {
-        form.appendChild(this.text)
+    reset(): void {
+        this.passwordInput.reset()
+        this.totpInput.reset()
+    }
 
-        this.credentials.mount(form)
-        this.credentialsFile.mount(form)
+    submit(): { password: string; totp_code: string } | null {
+        const password = this.passwordInput.getValue()
+        if (!password) return null
+        return { password, totp_code: this.totpInput.getValue() }
+    }
+
+    mountForm(form: HTMLFormElement): void {
+        const title = document.createElement("h3")
+        title.innerText = "Sign In"
+        form.appendChild(title)
+        this.passwordInput.mount(form)
+        this.totpInput.mount(form)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// TOTP modal — for the 2-step login flow when server says requires_totp
+// ---------------------------------------------------------------------------
+
+class TotpModal extends FormModal<string> {
+    private codeInput: InputComponent
+
+    constructor() {
+        super()
+        this.codeInput = new InputComponent("ml-totp-code", "text", "Authenticator Code", {
+            inputMode: "numeric",
+        })
+    }
+
+    reset(): void {
+        this.codeInput.reset()
+    }
+
+    submit(): string | null {
+        return this.codeInput.getValue() || null
+    }
+
+    mountForm(form: HTMLFormElement): void {
+        const title = document.createElement("h3")
+        title.innerText = "Two-Factor Authentication"
+        const hint = document.createElement("p")
+        hint.innerText = "Enter the 6-digit code from your authenticator app."
+        form.appendChild(title)
+        form.appendChild(hint)
+        this.codeInput.mount(form)
     }
 }
 
@@ -318,4 +470,10 @@ export async function apiHostCancel(api: Api, request: PostCancelRequest): Promi
     })
 
     return response as PostCancelResponse
+}
+
+/** Clear the stored session and force a fresh login on next load. */
+export function logout() {
+    localStorage.removeItem(SESSION_STORAGE_KEY)
+    currentApi = null
 }

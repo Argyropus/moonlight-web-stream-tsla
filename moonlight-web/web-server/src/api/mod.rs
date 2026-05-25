@@ -20,7 +20,7 @@ use tokio::sync::Mutex;
 
 use crate::{
     Config,
-    api::auth::auth_middleware,
+    api::auth::{auth_middleware, post_auth_login, get_auth_info, get_totp_setup, post_totp_enable, delete_totp},
     data::{HostCache, RuntimeApiData, RuntimeApiHost},
 };
 use common::api_bindings::{
@@ -397,6 +397,13 @@ pub fn api_service(data: Data<RuntimeApiData>) -> impl HttpServiceFactory {
         .app_data(data)
         .service(services![
             authenticate,
+            post_auth_login,
+            get_auth_info,
+            get_totp_setup,
+            post_totp_enable,
+            delete_totp,
+        ])
+        .service(services![
             stream::start_host,
             stream::cancel_host,
             list_hosts,

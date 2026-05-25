@@ -19,6 +19,9 @@ https://youtu.be/whdvHChCQbg?si=WLcgPDclkdr8n41i
   - [Configuring https](#configuring-https)
   - [Proxying via Apache 2](#proxying-via-apache-2)
 - [Config](#config)
+  - [Credentials](#credentials)
+  - [Two-Factor Authentication (2FA)](#two-factor-authentication-2fa)
+  - [Bind Address](#bind-address)
 - [Contributors](#contributors)
 - [Building](#building)
 
@@ -230,6 +233,21 @@ If you set this null authentication will be disabled and the `Authorization` hea
     "credentials": null
 }
 ```
+
+### Two-Factor Authentication (2FA)
+Once logged in you can enable 2FA (TOTP) from the **Settings → Security** section.
+
+1. Click **Set Up Two-Factor Authentication**.
+2. A 32-character base32 secret key is shown. Enter it into your authenticator app using the "Enter setup key" option (Google Authenticator, Authy, etc.). Set the algorithm to **SHA1**, digits to **6**, and period to **30 s**.
+3. Enter the 6-digit code displayed by the app to confirm, then click **Ok**.
+
+From this point every login requires your password **and** the current TOTP code.
+
+The secret is saved into `server/config.json` under the key `totp_secret`. Active sessions are stored in `server/sessions.json` and survive server restarts. Sessions expire automatically after **90 days**.
+
+To disable 2FA, click **Disable Two-Factor Authentication** in the same section.
+
+> **Note:** 2FA only protects the web interface. It has no effect on the Sunshine pairing process.
 
 ### Bind Address 
 The address and port the website will run on

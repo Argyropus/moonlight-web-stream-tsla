@@ -60,15 +60,20 @@ async fn exit() -> Result<(), anyhow::Error> {
 
 async fn main2() -> Result<(), anyhow::Error> {
     // Load Config
-    let config = read_or_default::<Config>("./server/config.json").await;
+    const CONFIG_PATH: &str = "./server/config.json";
+    let config = read_or_default::<Config>(CONFIG_PATH).await;
     if config.credentials.as_deref() == Some("default") {
         info!("Enter your credentials in the config (server/config.json)");
 
         return Ok(());
     }
-    let credentials = Data::new(ApiCredentials {
-        credentials: config.credentials.clone(),
-    });
+    let creds = ApiCredentials::new(
+        config.credentials.clone(),
+        config.totp_secret.clone(),
+        CONFIG_PATH.to_string(),
+    );
+    creds.load_sessions().await;
+    let credentials = Data::new(creds);
 
     let config = Data::new(config);
 

@@ -8,6 +8,9 @@ use crate::api_bindings::RtcIceServer;
 pub struct Config {
     /// Use the ApiCredentials struct instead if you are verify the user!
     pub credentials: Option<String>,
+    /// Base32-encoded TOTP secret for 2FA. Set via the web UI; do not edit manually.
+    #[serde(default)]
+    pub totp_secret: Option<String>,
     #[serde(default = "data_path_default")]
     pub data_path: String,
     #[serde(default = "default_bind_address")]
@@ -73,6 +76,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             credentials: Some("default".to_string()),
+            totp_secret: None,
             data_path: data_path_default(),
             bind_address: default_bind_address(),
             moonlight_default_http_port: moonlight_default_http_port_default(),
