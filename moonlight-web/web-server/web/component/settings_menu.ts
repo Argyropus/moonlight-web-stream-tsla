@@ -348,6 +348,11 @@ export class StreamSettingsComponent implements Component {
         this.showStreamStats.addChangeListener(this.onSettingsChange.bind(this))
         this.showStreamStats.mount(advancedSection)
 
+        const resetButton = document.createElement("button")
+        resetButton.innerText = "Reset to Default Settings"
+        resetButton.addEventListener("click", () => this.resetToDefaults())
+        advancedSection.appendChild(resetButton)
+
         // --- Security Settings ---
         if (api) {
             const securitySection = createSection("Security")
@@ -371,6 +376,7 @@ export class StreamSettingsComponent implements Component {
 
             this.logoutButton.innerText = "Log Out"
             this.logoutButton.style.background = "rgba(180,40,40,0.8)"
+            this.logoutButton.style.color = "white"
             this.logoutButton.addEventListener("click", () => {
                 logout()
                 location.reload()
@@ -442,6 +448,11 @@ export class StreamSettingsComponent implements Component {
         }
 
         this.divElement.dispatchEvent(new ComponentEvent("ml-settingschange", this))
+    }
+
+    resetToDefaults() {
+        setLocalStreamSettings(defaultStreamSettings())
+        location.reload()
     }
 
     addChangeListener(listener: StreamSettingsChangeListener) {
