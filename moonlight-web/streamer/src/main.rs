@@ -42,8 +42,13 @@ use webrtc::{
     peer_connection::{
         RTCPeerConnection,
         configuration::RTCConfiguration,
+        offer_answer_options::RTCOfferOptions,
         peer_connection_state::RTCPeerConnectionState,
         sdp::{sdp_type::RTCSdpType, session_description::RTCSessionDescription},
+    },
+    rtp_transceiver::{
+        rtp_codec::RTPCodecType,
+        rtp_sender::RTCRtpSender,
     },
     data_channel::data_channel_init::RTCDataChannelInit,
 };
@@ -295,9 +300,14 @@ struct StreamConnection {
     pub input: StreamInput,
     // Video
     pub video_size: Mutex<(u32, u32)>,
+    // Pre-registered video sender (transceiver added before first offer/answer so
+    // all codecs are in the SDP; the actual track is attached via replace_track in setup())
+    pub pre_video_sender: Mutex<Option<Arc<RTCRtpSender>>>,
     // Stream
     pub stream: RwLock<Option<MoonlightStream>>,
     pub terminate: Notify,
+    // ICE restart tracking
+    pub ice_restart_attempted: std::sync::atomic::AtomicBool,
 }
 
 impl StreamConnection {
@@ -353,9 +363,29 @@ impl StreamConnection {
             audio_channel,
             video_size: Mutex::new((0, 0)),
             input,
+            pre_video_sender: Mutex::new(None),
             stream: Default::default(),
             terminate: Notify::new(),
+            ice_restart_attempted: std::sync::atomic::AtomicBool::new(false),
         });
+
+        // Pre-register a bare video transceiver so the initial SDP includes ALL supported
+        // video codecs. The correct-codec track is attached via replace_track() in setup(),
+        // avoiding any renegotiation (and its ICE-disrupting effects) regardless of which
+        // codec Moonlight ultimately selects (H264, H265, AV1, etc.).
+        match peer.add_transceiver_from_kind(
+            RTPCodecType::Video,
+            None,
+        ).await {
+            Ok(transceiver) => {
+                let sender = transceiver.sender().await;
+                *this.pre_video_sender.lock().await = Some(sender);
+                info!("[Stream] Pre-registered video transceiver (codec-agnostic)");
+            }
+            Err(err) => {
+                warn!("[Stream] Failed to pre-register video transceiver: {err:?}");
+            }
+        }
 
         // -- Connection state
         peer.on_ice_connection_state_change({
@@ -438,12 +468,25 @@ impl StreamConnection {
         }
     }
     async fn on_peer_connection_state_change(&self, state: RTCPeerConnectionState) {
-        if matches!(
-            state,
-            RTCPeerConnectionState::Failed
-                | RTCPeerConnectionState::Closed
-        ) {
-            self.stop().await;
+        match state {
+            RTCPeerConnectionState::Failed => {
+                // Attempt ICE restart once before giving up
+                if !self.ice_restart_attempted.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    warn!("[Stream]: Peer connection failed, attempting ICE restart...");
+                    self.send_offer_with_ice_restart().await;
+                } else {
+                    warn!("[Stream]: Peer connection failed after ICE restart, stopping.");
+                    self.stop().await;
+                }
+            }
+            RTCPeerConnectionState::Connected => {
+                // Reset ICE restart flag on successful reconnection
+                self.ice_restart_attempted.store(false, std::sync::atomic::Ordering::SeqCst);
+            }
+            RTCPeerConnectionState::Closed => {
+                self.stop().await;
+            }
+            _ => {}
         }
     }
 
@@ -489,10 +532,15 @@ impl StreamConnection {
 
         true
     }
-    async fn send_offer(&self) -> bool {
-        let local_description = match self.peer.create_offer(None).await {
+
+    async fn send_offer_with_ice_restart(&self) -> bool {
+        let options = RTCOfferOptions {
+            ice_restart: true,
+            ..Default::default()
+        };
+        let local_description = match self.peer.create_offer(Some(options)).await {
             Err(err) => {
-                warn!("[Signaling]: failed to create offer: {err:?}");
+                warn!("[Signaling]: failed to create ICE restart offer: {err:?}");
                 return false;
             }
             Ok(value) => value,
@@ -503,13 +551,12 @@ impl StreamConnection {
             .set_local_description(local_description.clone())
             .await
         {
-            warn!("[Signaling]: failed to set local description: {err:?}");
+            warn!("[Signaling]: failed to set local description for ICE restart: {err:?}");
             return false;
         }
 
-        debug!(
-            "[Signaling] Sending Local Description as Offer: {:?}",
-            local_description.sdp
+        info!(
+            "[Signaling] Sending ICE Restart Offer"
         );
 
         self.ipc_sender

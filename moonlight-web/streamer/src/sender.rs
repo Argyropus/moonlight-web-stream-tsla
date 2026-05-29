@@ -1,4 +1,4 @@
-use std::sync::Arc;
+﻿use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
 
 use log::warn;
@@ -12,6 +12,7 @@ use webrtc::{
         self,
         extension::{HeaderExtension, playout_delay_extension::PlayoutDelayExtension},
     },
+    rtp_transceiver::rtp_sender::RTCRtpSender,
     track::track_local::{
         TrackLocal, track_local_static_rtp::TrackLocalStaticRTP,
         track_local_static_sample::TrackLocalStaticSample,
@@ -64,7 +65,7 @@ where
             async move { stream.peer.add_track(track.track()).await }
         })?;
 
-        // Read incoming RTCP packets
+        // Read incoming RTCP packets.
         // Before these packets are returned they are processed by interceptors. For things
         // like NACK this needs to be called.
         self.stream.runtime.spawn(async move {
@@ -88,10 +89,55 @@ where
     }
 }
 
+impl TrackLocalSender<SequencedTrackLocalStaticRTP> {
+    /// Activate the sender by replacing the track on an existing transceiver sender.
+    /// This is codec-agnostic: the transceiver was added with all codecs in the SDP,
+    /// and we now attach the track for whichever codec Moonlight actually selected.
+    /// No renegotiation is triggered.
+    pub fn blocking_activate_via_replace_track(
+        &mut self,
+        track: Arc<TrackLocalStaticRTP>,
+        rtp_sender: Arc<RTCRtpSender>,
+        mut on_packet: impl FnMut(Box<dyn Packet + Send + Sync>) + Send + 'static,
+    ) -> Result<(), anyhow::Error> {
+        let sequenced = Arc::new(SequencedTrackLocalStaticRTP::from_arc(track.clone()));
+
+        // Attach the track to the pre-existing transceiver sender.
+        // The inner TrackLocalStaticRTP is what pion binds to its interceptor chain.
+        self.stream.runtime.block_on(
+            rtp_sender.replace_track(Some(sequenced.track.clone()))
+        )?;
+
+        let (sender, receiver) = channel(self.channel_queue_size);
+
+        self.stream.runtime.spawn({
+            let track = sequenced.clone();
+            async move {
+                sample_sender(track, receiver).await;
+            }
+        });
+
+        self.stream.runtime.spawn(async move {
+            let mut rtcp_buf = vec![0u8; 1500];
+            while let Ok((packets, _)) = rtp_sender.read(&mut rtcp_buf).await {
+                for packet in packets {
+                    on_packet(packet);
+                }
+            }
+        });
+
+        self.sender.replace(sender);
+        Ok(())
+    }
+}
+
 async fn sample_sender<Track>(track: Arc<Track>, mut receiver: Receiver<Track::Sample>)
 where
     Track: TrackLike,
 {
+    // Playout delay: (0, 0) = let the browser use its own adaptive jitter buffer
+    // with no constraints. This minimizes latency. The browser will still buffer
+    // internally based on observed network jitter.
     let extensions = [HeaderExtension::PlayoutDelay(PlayoutDelayExtension::new(
         0, 0,
     ))];
@@ -147,6 +193,15 @@ impl From<TrackLocalStaticRTP> for SequencedTrackLocalStaticRTP {
     fn from(value: TrackLocalStaticRTP) -> Self {
         Self {
             track: Arc::new(value),
+            sequence_number: AtomicU16::new(0),
+        }
+    }
+}
+
+impl SequencedTrackLocalStaticRTP {
+    pub(crate) fn from_arc(track: Arc<TrackLocalStaticRTP>) -> Self {
+        Self {
+            track,
             sequence_number: AtomicU16::new(0),
         }
     }

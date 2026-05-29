@@ -150,7 +150,8 @@ impl AudioDecoder for OpusTrackSampleAudioDecoder {
 
             // Aggregation buffer for outgoing chunks
             let mut pending: Vec<Bytes> = Vec::new();
-            // Flush interval (milliseconds) — small latency tradeoff for fewer messages
+            // Flush interval — batches multiple Opus frames into one DataChannel message.
+            // At 48kHz/5ms per frame, 10ms accumulates ~2 frames per send.
             let mut interval = time::interval(Duration::from_millis(10));
 
             loop {

@@ -23,10 +23,16 @@ export type WorkerStatsMessage = {
     minGapMs: number
     avgGapMs: number
     maxGapMs: number
+    /** source frame timestamp gap stats (ms); -1 means no data — detects encoder pacing issues */
+    srcMinGapMs: number
+    srcAvgGapMs: number
+    srcMaxGapMs: number
 }
 
 let canvas: OffscreenCanvas | null = null
 let ctx: OffscreenCanvasRenderingContext2D | null = null
+let bitmapCtx: ImageBitmapRenderingContext | null = null
+let useBitmapRenderer = false
 let stretchToFit = false
 let drawWidth = 0
 let drawHeight = 0
@@ -54,20 +60,10 @@ async function readStreamLoop(reader: ReadableStreamDefaultReader<VideoFrame>) {
 }
 
 // === Draw-immediately strategy ===
-// On a 60Hz display, only the latest frame matters at each v-sync. Scheduling frames
-// to smooth out decoder batch delivery adds latency, clock drift, and frame drops
-// without improving what actually appears on screen. The display composites the
-// latest canvas content regardless of when individual drawImage calls happened.
-//
-// The previous scheduler approaches all failed due to:
-// - Encoder clock vs performance.now() drift (compounds over minutes)
-// - createImageBitmap async ordering races
-// - Decoder buffer starvation from holding VideoFrames in queues
-// - setTimeout jitter accumulation
-//
-// Draw-immediately: zero drops, zero added latency, zero drift. The burst delivery
-// pattern (0.2/17.5/31.8ms gaps) is invisible on a 60Hz panel because the display
-// only samples once every 16.6ms regardless.
+// On a 60Hz display the compositor picks up the latest canvas content at vsync
+// regardless of how many drawImage calls happened. Drawing immediately on frame
+// arrival ensures zero added latency and zero drift. At 60fps stream on 60Hz
+// display this is exactly 1 draw per vsync.
 
 let lastDrawnTimestamp: number = -1
 let workerDrawn = 0
@@ -81,11 +77,20 @@ let gapMax = -Infinity
 let gapSum = 0
 let gapCount = 0
 
-function clearPresentationQueue() { /* no queue to clear */ }
+// Source frame timestamp gap tracking (detects encoder-side unevenness)
+let lastFrameTimestamp = -1
+let srcGapMin = Infinity
+let srcGapMax = -Infinity
+let srcGapSum = 0
+let srcGapCount = 0
+
+function clearPresentationQueue() { /* no queue — draw immediately */ }
 
 function scheduleFrame(frame: VideoFrame) {
     // Track inter-frame arrival gap
-    const nowMs = performance.now()
+    const nowMs = typeof frame.timestamp === "number" && Number.isFinite(frame.timestamp)
+        ? frame.timestamp / 1000
+        : Date.now()
     if (lastArrivalMs >= 0) {
         const gap = nowMs - lastArrivalMs
         if (gap < gapMin) gapMin = gap
@@ -96,33 +101,52 @@ function scheduleFrame(frame: VideoFrame) {
     lastArrivalMs = nowMs
     arrivalCount++
 
-    // Monotonic guard — discard out-of-order/duplicate frames
-    if (frame.timestamp <= lastDrawnTimestamp) {
+    // Monotonic guard — discard exact duplicate timestamps only
+    if (frame.timestamp === lastDrawnTimestamp) {
         frame.close()
         workerDropped++
         return
     }
+
+    // Track source frame timestamp gaps (encoder pacing)
+    if (lastFrameTimestamp >= 0 && frame.timestamp > lastFrameTimestamp) {
+        const srcGap = (frame.timestamp - lastFrameTimestamp) / 1000 // μs → ms
+        if (srcGap < srcGapMin) srcGapMin = srcGap
+        if (srcGap > srcGapMax) srcGapMax = srcGap
+        srcGapSum += srcGap
+        srcGapCount++
+    }
+    lastFrameTimestamp = frame.timestamp
+
     lastDrawnTimestamp = frame.timestamp
-    drawFrame(frame)  // drawFrame calls frame.close() — decoder buffer released immediately
+    drawFrame(frame)  // calls frame.close() — decoder buffer released immediately
     workerDrawn++
 }
 
-// Post stats back to the main thread every second
+// Reusable stats message — avoids allocation each interval
+const statsMsg: WorkerStatsMessage = {
+    type: "stats", drawn: 0, dropped: 0, arrived: 0,
+    minGapMs: -1, avgGapMs: -1, maxGapMs: -1,
+    srcMinGapMs: -1, srcAvgGapMs: -1, srcMaxGapMs: -1,
+}
+
+// Post stats back to main thread every 2s (matches overlay refresh; reduces GC pressure)
 setInterval(() => {
-    const msg: WorkerStatsMessage = {
-        type: "stats",
-        drawn: workerDrawn,
-        dropped: workerDropped,
-        arrived: arrivalCount,
-        minGapMs: gapCount > 0 ? gapMin : -1,
-        avgGapMs: gapCount > 0 ? gapSum / gapCount : -1,
-        maxGapMs: gapCount > 0 ? gapMax : -1,
-    }
-    workerSelf.postMessage(msg)
+    statsMsg.drawn = workerDrawn
+    statsMsg.dropped = workerDropped
+    statsMsg.arrived = arrivalCount
+    statsMsg.minGapMs = gapCount > 0 ? gapMin : -1
+    statsMsg.avgGapMs = gapCount > 0 ? gapSum / gapCount : -1
+    statsMsg.maxGapMs = gapCount > 0 ? gapMax : -1
+    statsMsg.srcMinGapMs = srcGapCount > 0 ? srcGapMin : -1
+    statsMsg.srcAvgGapMs = srcGapCount > 0 ? srcGapSum / srcGapCount : -1
+    statsMsg.srcMaxGapMs = srcGapCount > 0 ? srcGapMax : -1
+    workerSelf.postMessage(statsMsg)
     // Reset interval accumulators
     arrivalCount = 0
     gapMin = Infinity; gapMax = -Infinity; gapSum = 0; gapCount = 0
-}, 1000)
+    srcGapMin = Infinity; srcGapMax = -Infinity; srcGapSum = 0; srcGapCount = 0
+}, 2000)
 
 function recalcForFrame(frame: VideoFrame) {
     if (!canvas) return
@@ -159,13 +183,33 @@ function recalcForFrame(frame: VideoFrame) {
 }
 
 function drawFrame(frame: VideoFrame) {
-    if (!canvas || !ctx) {
+    if (!canvas) {
         frame.close()
         return
     }
 
     if (drawWidth === 0 || drawHeight === 0) {
         recalcForFrame(frame)
+    }
+
+    if (useBitmapRenderer && bitmapCtx) {
+        // ImageBitmapRenderingContext path: atomic frame handoff to compositor
+        // createImageBitmap resize handles scaling; transferFromImageBitmap is a
+        // zero-copy ownership transfer that guarantees the compositor picks it up.
+        createImageBitmap(frame, {
+            resizeWidth: drawWidth,
+            resizeHeight: drawHeight,
+            resizeQuality: "low",
+        }).then(bitmap => {
+            bitmapCtx!.transferFromImageBitmap(bitmap)
+        }).catch(() => {})
+        frame.close()
+        return
+    }
+
+    if (!ctx) {
+        frame.close()
+        return
     }
 
     if (offsetX !== 0 || offsetY !== 0) {
@@ -189,7 +233,17 @@ workerSelf.onmessage = (event: MessageEvent<WorkerMessage>) => {
         drawHeight = 0
         offsetX = 0
         offsetY = 0
-        ctx = canvas.getContext("2d")
+        // Try bitmaprenderer first — it uses transferFromImageBitmap which is an
+        // atomic compositor handoff, avoiding the 30fps compositing bug with 2D context
+        // in worker OffscreenCanvas on some Chromium builds (e.g. Tesla browser).
+        bitmapCtx = canvas.getContext("bitmaprenderer", { alpha: false }) as ImageBitmapRenderingContext | null
+        if (bitmapCtx) {
+            useBitmapRenderer = true
+            ctx = null
+        } else {
+            useBitmapRenderer = false
+            ctx = canvas.getContext("2d", { alpha: false, desynchronized: true })
+        }
         return
     }
 

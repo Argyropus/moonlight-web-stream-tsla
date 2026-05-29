@@ -811,6 +811,8 @@ ts_consts!(
     pub const LEFT: i32 = MouseButton::Left as i32;
     pub const MIDDLE: i32 = MouseButton::Middle as i32;
     pub const RIGHT: i32 = MouseButton::Right as i32;
+    pub const X1: i32 = MouseButton::X1 as i32;
+    pub const X2: i32 = MouseButton::X2 as i32;
 );
 
 // Controller Buttons

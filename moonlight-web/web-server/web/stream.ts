@@ -1,3 +1,4 @@
+import "./polyfill/index.js"
 import { Api, getApi } from "./api.js";
 import { Component } from "./component/index.js";
 import { showErrorPopup } from "./component/error.js";
@@ -11,7 +12,8 @@ import { getStandardVideoFormats, getSupportedVideoFormats } from "./stream/vide
 import { CanvasRenderer } from "./stream/canvas.js";
 import { StreamCapabilities, StreamKeys } from "./api_bindings.js";
 import { getTeslaVirtualSwapOverride, setTeslaVirtualSwapOverride } from "./stream/gamepad.js";
-import { ScreenKeyboard, TextEvent } from "./screen_keyboard.js";
+import { KeyboardModeEvent, ScreenKeyboard, TextEvent } from "./screen_keyboard.js";
+import { requestKeyboardLock } from "./iframe.js";
 import { FormModal } from "./component/modal/form.js";
 import { StreamStatsOverlay } from "./component/stream_stats.js";
 
@@ -82,7 +84,6 @@ class ViewerApp implements Component {
 
     private div = document.createElement("div")
     private videoElement = document.createElement("video")
-    private keepAliveContext: AudioContext | null = null
     private canvasElement = document.createElement("canvas")
 
     private stream: Stream | null = null
@@ -101,7 +102,10 @@ class ViewerApp implements Component {
     private wakeLock: WakeLockSentinel | null = null
     private hasInteracted = false
     private cachedStreamRect: DOMRect | null = null
-    private pollIntervalId: ReturnType<typeof setInterval> | null = null
+    private pollRafId: number | null = null
+    private pollTimerId: ReturnType<typeof setTimeout> | null = null
+    private pollLoopRunning: boolean = false
+    private gamepadPollToggle: boolean = false  // poll gamepads at 30Hz (every other frame)
 
     constructor(api: Api, hostId: number, appId: number) {
         this.api = api
@@ -141,30 +145,9 @@ class ViewerApp implements Component {
         this.videoElement.playsInline = true
         this.videoElement.muted = true
 
-        // Configure keep alive audio
-        try {
-            // @ts-ignore
-            const AudioContext = window.AudioContext || window.webkitAudioContext;
-            this.keepAliveContext = new AudioContext();
-            
-            // Create an oscillator (sine wave)
-            const oscillator = this.keepAliveContext.createOscillator();
-            oscillator.type = 'sine';
-            oscillator.frequency.value = 440; // Hz
-
-            // Create a gain node to make it inaudible but active
-            const gainNode = this.keepAliveContext.createGain();
-            // extremely low volume, effectively silent but active
-            gainNode.gain.value = 0.0001; 
-
-            oscillator.connect(gainNode);
-            gainNode.connect(this.keepAliveContext.destination);
-            
-            oscillator.start();
-            
-            console.log("Keep alive oscillator started");
-        } catch (e) {
-            console.error("Failed to set up keep alive audio context", e)
+        // Apply stretch-to-fit for video element mode
+        if(!this.settings.canvasRenderer && this.settings.stretchToFit) {
+            this.videoElement.classList.add("video-stream-stretched")
         }
 
         // Configure canvas element
@@ -192,6 +175,10 @@ class ViewerApp implements Component {
 
         // Invalidate cached stream rect on resize
         window.addEventListener("resize", () => { this.cachedStreamRect = null })
+        // Also invalidate when the video element itself resizes (e.g. when the video
+        // stream starts and its intrinsic dimensions become known, causing the element
+        // to reflow from its initial min-width/min-height square into the correct ratio)
+        new ResizeObserver(() => { this.cachedStreamRect = null }).observe(this.videoElement)
 
         window.addEventListener("gamepadconnected", this.onGamepadConnect.bind(this))
         window.addEventListener("gamepaddisconnected", this.onGamepadDisconnect.bind(this))
@@ -205,6 +192,7 @@ class ViewerApp implements Component {
     private addListeners(element: GlobalEventHandlers) {
         element.addEventListener("keydown", this.onKeyDown.bind(this), { passive: false })
         element.addEventListener("keyup", this.onKeyUp.bind(this), { passive: false })
+        element.addEventListener("paste", this.onPaste.bind(this) as any)
 
         element.addEventListener("mousedown", this.onMouseButtonDown.bind(this), { passive: false })
         element.addEventListener("mouseup", this.onMouseButtonUp.bind(this), { passive: false })
@@ -251,11 +239,7 @@ class ViewerApp implements Component {
             this.videoElement.srcObject = this.stream.getMediaStream()
         }
 
-        // Poll inputs 25 times a second
-        this.pollIntervalId = setInterval(() => {
-            this.onTouchUpdate()
-            this.onGamepadUpdate()
-        }, 40)
+        this.ensurePollLoopRunning()
 
         this.stream.getInput().addScreenKeyboardVisibleEvent(this.onScreenKeyboardSetVisible.bind(this))
         
@@ -306,10 +290,6 @@ class ViewerApp implements Component {
         this.focusInput()
 
         this.stream?.resumeAudio();
-
-        if (this.keepAliveContext?.state === 'suspended') {
-            this.keepAliveContext.resume()
-        }
 
         if (this.videoElement) {
             this.videoElement.muted = false
@@ -363,8 +343,14 @@ class ViewerApp implements Component {
     onKeyDown(event: KeyboardEvent) {
         this.onUserInteraction()
 
-        event.preventDefault()
-        this.stream?.getInput().onKeyDown(event)
+        if (event.ctrlKey && event.code == "KeyV") {
+            // We are likely pasting -> don't send keys
+        } else if (event.code == "F11") {
+            // Allow manual fullscreen
+        } else {
+            event.preventDefault()
+            this.stream?.getInput().onKeyDown(event)
+        }
 
         event.stopPropagation()
     }
@@ -395,6 +381,14 @@ class ViewerApp implements Component {
                 this.isTogglingFullscreenWithKeybind = "none"
             })()
         }
+    }
+
+    onPaste(event: ClipboardEvent) {
+        this.onUserInteraction()
+
+        this.stream?.getInput().onPaste(event)
+
+        event.stopPropagation()
     }
 
     // Mouse
@@ -438,6 +432,7 @@ class ViewerApp implements Component {
 
         event.preventDefault()
         this.stream?.getInput().onTouchStart(event, this.getStreamRect())
+        this.ensurePollLoopRunning()
 
         event.stopPropagation()
     }
@@ -446,6 +441,7 @@ class ViewerApp implements Component {
 
         event.preventDefault()
         this.stream?.getInput().onTouchEnd(event, this.getStreamRect())
+        this.ensurePollLoopRunning()
 
         event.stopPropagation()
     }
@@ -454,6 +450,7 @@ class ViewerApp implements Component {
 
         event?.preventDefault()
         this.stream?.getInput().onTouchCancel(event, this.getStreamRect())
+        this.ensurePollLoopRunning()
 
         event.stopPropagation()
     }
@@ -473,12 +470,69 @@ class ViewerApp implements Component {
     }
     onGamepadAdd(gamepad: Gamepad) {
         this.stream?.getInput().onGamepadConnect(gamepad)
+        this.ensurePollLoopRunning()
     }
     onGamepadDisconnect(event: GamepadEvent) {
         this.stream?.getInput().onGamepadDisconnect(event)
+        this.ensurePollLoopRunning()
     }
     onGamepadUpdate() {
         this.stream?.getInput().onGamepadUpdate()
+    }
+
+    private shouldPollInputs(): boolean {
+        const input = this.stream?.getInput()
+        if (!input) return false
+        return input.hasPrimaryTouch() || input.hasGamepads()
+    }
+
+    private ensurePollLoopRunning() {
+        if (this.pollLoopRunning || !this.shouldPollInputs()) {
+            return
+        }
+
+        this.pollLoopRunning = true
+        const pollLoop = () => {
+            const input = this.stream?.getInput()
+            if (!input) {
+                this.pollLoopRunning = false
+                this.pollRafId = null
+                this.pollTimerId = null
+                return
+            }
+
+            const hasPrimaryTouch = input.hasPrimaryTouch()
+
+            if (hasPrimaryTouch) {
+                this.onTouchUpdate()
+            }
+
+            // Poll gamepads at 30Hz (every other rAF). navigator.getGamepads()
+            // is expensive on Tesla (~100μs+ per call due to object allocation).
+            // 33ms input latency is imperceptible for controller input.
+            this.gamepadPollToggle = !this.gamepadPollToggle
+            if (this.gamepadPollToggle && input.hasGamepads()) {
+                this.onGamepadUpdate()
+            }
+
+            if (!this.shouldPollInputs()) {
+                this.pollLoopRunning = false
+                this.pollRafId = null
+                this.pollTimerId = null
+                return
+            }
+
+            // Always use rAF for both touch and gamepad polling.
+            // This syncs input sampling with the display refresh (~16.6ms at 60Hz),
+            // reducing input latency from 50ms to ~16ms for gamepads while keeping
+            // touch tracking smooth. navigator.getGamepads() allocates a new array
+            // each call but at 60Hz the GC pressure is negligible.
+            this.pollRafId = requestAnimationFrame(pollLoop)
+            this.pollTimerId = null
+        }
+
+        this.pollRafId = requestAnimationFrame(pollLoop)
+        this.pollTimerId = null
     }
 
     // Fullscreen
@@ -503,13 +557,15 @@ class ViewerApp implements Component {
                 }
             }
 
-            if ("keyboard" in navigator && navigator.keyboard && "lock" in navigator.keyboard) {
-                await navigator.keyboard.lock()
+            try {
+                await requestKeyboardLock()
 
                 if (!this.hasShownFullscreenEscapeWarning) {
                     await showMessage("To exit Fullscreen you'll have to hold ESC for a few seconds.")
                 }
                 this.hasShownFullscreenEscapeWarning = true
+            } catch (e) {
+                console.warn("Keyboard lock failed", e)
             }
 
             if (this.getStream()?.getInput().getConfig().mouseMode == "relative") {
@@ -648,37 +704,59 @@ class ViewerApp implements Component {
 
         if(!this.settings?.canvasRenderer) {
             const boundingRect = this.videoElement.getBoundingClientRect()
+
+            if (this.settings?.stretchToFit) {
+                // Stretched: the entire bounding rect is the input surface
+                this.cachedStreamRect = boundingRect
+                return this.cachedStreamRect
+            }
+
+            // Use the video element's actual intrinsic dimensions when available.
+            // Before the video plays, videoWidth/videoHeight are 0 and the CSS box
+            // is forced to min-width/min-height (potentially a square), which would
+            // produce a wrong rect. Don't cache in that case.
+            const intrinsicW = this.videoElement.videoWidth
+            const intrinsicH = this.videoElement.videoHeight
+            const effectiveSize: [number, number] = (intrinsicW > 0 && intrinsicH > 0)
+                ? [intrinsicW, intrinsicH]
+                : videoSize
+            const effectiveAspect = effectiveSize[0] / effectiveSize[1]
             const boundingRectAspect = boundingRect.width / boundingRect.height
 
             let x = boundingRect.x
             let y = boundingRect.y
             let videoMultiplier
-            if (boundingRectAspect > videoAspect) {
+            if (boundingRectAspect > effectiveAspect) {
                 // How much is the video scaled up
-                videoMultiplier = boundingRect.height / videoSize[1]
+                videoMultiplier = boundingRect.height / effectiveSize[1]
 
                 // Note: Both in boundingRect / page scale
                 const boundingRectHalfWidth = boundingRect.width / 2
-                const videoHalfWidth = videoSize[0] * videoMultiplier / 2
+                const videoHalfWidth = effectiveSize[0] * videoMultiplier / 2
 
                 x += boundingRectHalfWidth - videoHalfWidth
             } else {
                 // Same as above but inverted
-                videoMultiplier = boundingRect.width / videoSize[0]
+                videoMultiplier = boundingRect.width / effectiveSize[0]
 
                 const boundingRectHalfHeight = boundingRect.height / 2
-                const videoHalfHeight = videoSize[1] * videoMultiplier / 2
+                const videoHalfHeight = effectiveSize[1] * videoMultiplier / 2
 
                 y += boundingRectHalfHeight - videoHalfHeight
             }
 
-            this.cachedStreamRect = new DOMRect(
+            const rect = new DOMRect(
                 x,
                 y,
-                videoSize[0] * videoMultiplier,
-                videoSize[1] * videoMultiplier
+                effectiveSize[0] * videoMultiplier,
+                effectiveSize[1] * videoMultiplier
             )
-            return this.cachedStreamRect
+            // Only cache once we have real intrinsic dimensions; otherwise the video
+            // element is still at its pre-load size and we'd cache a wrong rect.
+            if (intrinsicW > 0) {
+                this.cachedStreamRect = rect
+            }
+            return rect
         }
         else {
             const clientRect = this.canvasElement.getBoundingClientRect()
@@ -720,6 +798,61 @@ class ViewerApp implements Component {
     }
     getStream(): Stream | null {
         return this.stream
+    }
+
+    setBrightness(value: number) {
+        // value = 0 (no effect) to 1 (max shadow boost)
+        // Gamma curve lifts dark pixels disproportionately; saturation compensation
+        // counteracts the perceived colour washout caused by dynamic-range compression.
+        if (!this.shadowBoostSvg) this.setupShadowBoostFilter()
+        const exponent = 1 - value * 0.7  // 0 -> 1.0 (linear), 1 -> 0.3 (strong lift)
+        for (const fn of this.shadowBoostFuncs) {
+            fn.setAttribute('exponent', String(exponent))
+        }
+        // Saturation scales with boost: 0 -> 1.0, 1 -> 1.6
+        const saturation = 1 + value * 0.6
+        const filterStr = value === 0 ? '' : `url(#ml-shadow-filter) saturate(${saturation})`
+        this.canvasElement.style.filter = filterStr
+        this.videoElement.style.filter = filterStr
+        try { localStorage.setItem('mlShadowBoost', String(value)) } catch (_) {}
+    }
+
+    private shadowBoostSvg: SVGSVGElement | null = null
+    private shadowBoostFuncs: Element[] = []
+    private setupShadowBoostFilter() {
+        const ns = 'http://www.w3.org/2000/svg'
+        const svg = document.createElementNS(ns, 'svg') as SVGSVGElement
+        svg.style.cssText = 'display:none;position:absolute;'
+        const filter = document.createElementNS(ns, 'filter')
+        filter.id = 'ml-shadow-filter'
+        filter.setAttribute('color-interpolation-filters', 'sRGB')
+        const transfer = document.createElementNS(ns, 'feComponentTransfer')
+        const funcs: Element[] = []
+        for (const ch of ['R', 'G', 'B']) {
+            const fn = document.createElementNS(ns, `feFunc${ch}`)
+            fn.setAttribute('type', 'gamma')
+            fn.setAttribute('amplitude', '1')
+            fn.setAttribute('exponent', '1')
+            fn.setAttribute('offset', '0')
+            transfer.appendChild(fn)
+            funcs.push(fn)
+        }
+        filter.appendChild(transfer)
+        svg.appendChild(filter)
+        document.body.appendChild(svg)
+        this.shadowBoostSvg = svg
+        this.shadowBoostFuncs = funcs
+    }
+
+    getBrightness(): number {
+        try {
+            const saved = localStorage.getItem('mlShadowBoost')
+            if (saved !== null) {
+                const v = parseFloat(saved)
+                if (isFinite(v) && v >= 0 && v <= 1) return v
+            }
+        } catch (_) {}
+        return 0
     }
 }
 
@@ -848,10 +981,13 @@ class ViewerSidebar implements Component, Sidebar {
     private sendKeycodeButton = document.createElement("button")
 
     private keyboardButton = document.createElement("button")
+    private floatingKeyboardButton = document.createElement("button")
     private screenKeyboard = new ScreenKeyboard()
 
     private lockMouseButton = document.createElement("button")
     private fullscreenButton = document.createElement("button")
+    private brightnessSlider = document.createElement("input")
+    private brightnessLabel = document.createElement("label")
 
     private mouseMode: SelectComponent
     private touchMode: SelectComponent
@@ -894,9 +1030,22 @@ class ViewerSidebar implements Component, Sidebar {
         })
         this.buttonDiv.appendChild(this.keyboardButton)
 
+        this.floatingKeyboardButton.innerText = "\u2328\u00d7"
+        this.floatingKeyboardButton.title = "Hide Keyboard"
+        this.floatingKeyboardButton.style.cssText = "position:fixed;top:50%;right:12px;transform:translateY(-50%);width:44px;height:44px;z-index:1000;display:none;align-items:center;justify-content:center;border:1px solid rgba(100,200,255,0.6);border-radius:999px;background:rgba(0,0,0,0.55);color:white;font-size:18px;opacity:0.78;cursor:pointer;"
+        const hideKeyboard = (event: Event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            this.screenKeyboard.hide()
+            this.floatingKeyboardButton.style.display = "none"
+        }
+        this.floatingKeyboardButton.addEventListener("click", hideKeyboard)
+        this.floatingKeyboardButton.addEventListener("touchend", hideKeyboard)
+
         this.screenKeyboard.addKeyDownListener(this.onKeyDown.bind(this))
         this.screenKeyboard.addKeyUpListener(this.onKeyUp.bind(this))
         this.screenKeyboard.addTextListener(this.onText.bind(this))
+        this.screenKeyboard.addKeyboardModeListener(this.onKeyboardModeChange.bind(this))
         this.div.appendChild(this.screenKeyboard.getHiddenElement())
 
 
@@ -910,6 +1059,34 @@ class ViewerSidebar implements Component, Sidebar {
             }
         })
         this.buttonDiv.appendChild(this.fullscreenButton)
+
+        // Shadow Boost slider
+        const initialBrightness = this.app.getBrightness()
+        this.app.setBrightness(initialBrightness) // apply persisted value immediately
+
+        const brightnessWrapper = document.createElement("div")
+        brightnessWrapper.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:4px 0;"
+
+        const pct = Math.round(initialBrightness * 100)
+        this.brightnessLabel.innerText = `Shadow Boost: ${pct === 0 ? 'Off' : pct + '%'}`
+        this.brightnessLabel.style.cssText = "font-size:13px;color:#ccc;user-select:none;"
+
+        this.brightnessSlider.type = "range"
+        this.brightnessSlider.min = "0"
+        this.brightnessSlider.max = "1"
+        this.brightnessSlider.step = "0.05"
+        this.brightnessSlider.value = String(initialBrightness)
+        this.brightnessSlider.style.cssText = "width:100%;cursor:pointer;"
+        this.brightnessSlider.addEventListener("input", () => {
+            const v = parseFloat(this.brightnessSlider.value)
+            const p = Math.round(v * 100)
+            this.brightnessLabel.innerText = `Shadow Boost: ${p === 0 ? 'Off' : p + '%'}`
+            this.app.setBrightness(v)
+        })
+
+        brightnessWrapper.appendChild(this.brightnessLabel)
+        brightnessWrapper.appendChild(this.brightnessSlider)
+        this.buttonDiv.appendChild(brightnessWrapper)
 
         // Toggle Stats
         const statsButton = document.createElement("button")
@@ -1022,6 +1199,13 @@ class ViewerSidebar implements Component, Sidebar {
     private onKeyUp(event: KeyboardEvent) {
         this.app.getStream()?.getInput().onKeyUp(event)
     }
+    private onKeyboardModeChange(event: KeyboardModeEvent) {
+        if (event.detail.enabled) {
+            this.floatingKeyboardButton.style.display = "flex"
+        } else {
+            this.floatingKeyboardButton.style.display = "none"
+        }
+    }
 
     // -- Mouse Mode
     private onMouseModeChange() {
@@ -1046,9 +1230,14 @@ class ViewerSidebar implements Component, Sidebar {
 
     mount(parent: HTMLElement): void {
         parent.appendChild(this.div)
+        const appRoot = document.getElementById("root")
+        ;(appRoot ?? document.body).appendChild(this.floatingKeyboardButton)
     }
     unmount(parent: HTMLElement): void {
         parent.removeChild(this.div)
+        if (this.floatingKeyboardButton.parentElement) {
+            this.floatingKeyboardButton.parentElement.removeChild(this.floatingKeyboardButton)
+        }
     }
 }
 

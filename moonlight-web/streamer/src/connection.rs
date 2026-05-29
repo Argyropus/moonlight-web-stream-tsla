@@ -67,11 +67,9 @@ impl ConnectionListener for StreamConnectionListener {
     }
 
     fn connection_started(&mut self) {
-        // Renegotate because we now have the audio and video streams
-        let stream = self.stream.clone();
-        self.stream.runtime.spawn(async move {
-            stream.send_offer().await;
-        });
+        // Video track was pre-registered before the initial offer/answer,
+        // so no renegotiation is needed here. The track will be activated
+        // in TrackSampleVideoDecoder::setup() using the pre-registered track.
     }
 
     fn connection_terminated(&mut self, error_code: i32) {

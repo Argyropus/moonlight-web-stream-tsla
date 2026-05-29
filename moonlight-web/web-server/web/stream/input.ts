@@ -17,7 +17,6 @@ const TOUCH_AS_CLICK_MAX_TIME_MS = 300
 // How much to move to open up the screen keyboard when having three touches at the same time
 const TOUCHES_AS_KEYBOARD_DISTANCE = 100
 
-const CONTROLLER_RUMBLE_INTERVAL_MS = 60
 // When a virtual and physical controller connect within this many ms, prefer the physical and skip the virtual in auto mode
 const VIRTUAL_SUPPRESSION_MS = 200
 
@@ -150,7 +149,7 @@ export class StreamInput {
     }
 
     private addDebugLog(message: string) {
-        const now = performance.now()
+        const now = Date.now()
         this.debugLogs.push({ time: now, message })
         if (this.debugLogs.length > this.maxDebugLogs) {
             this.debugLogs.shift()
@@ -159,7 +158,8 @@ export class StreamInput {
     }
 
     getDebugLogs(): Array<string> {
-        return this.debugLogs.map((log, i) => `${(log.time / 1000).toFixed(2)}s [${i}] ${log.message}`)
+        const base = this.debugLogs.length > 0 ? this.debugLogs[0].time : 0
+        return this.debugLogs.map((log, i) => `${((log.time - base) / 1000).toFixed(2)}s [${i}] ${log.message}`)
     }
 
     // -- External Event Listeners
@@ -187,6 +187,19 @@ export class StreamInput {
     onKeyUp(event: KeyboardEvent) {
         this.sendKeyEvent(false, event)
     }
+
+    onPaste(event: ClipboardEvent) {
+        const data = event.clipboardData
+        if (!data) {
+            return
+        }
+
+        const text = data.getData("text/plain")
+        if (text) {
+            this.sendText(text)
+        }
+    }
+
     private sendKeyEvent(isDown: boolean, event: KeyboardEvent) {
         this.buffer.reset()
 
@@ -210,6 +223,8 @@ export class StreamInput {
         trySendChannel(this.keyboard, this.buffer)
     }
     sendText(text: string) {
+        this.buffer.reset()
+
         this.buffer.putU8(1)
 
         this.buffer.putU8(text.length)
@@ -252,11 +267,7 @@ export class StreamInput {
         }
     }
     onMouseWheel(event: WheelEvent) {
-        if (this.config.mouseScrollMode == "highres") {
-            this.sendMouseWheelHighRes(event.deltaX, -event.deltaY)
-        } else if (this.config.mouseScrollMode == "normal") {
-            this.sendMouseWheel(event.deltaX, -event.deltaY)
-        }
+        this.sendAccumulatedScroll(event.deltaX, -event.deltaY)
     }
 
     sendMouseMove(movementX: number, movementY: number) {
@@ -306,6 +317,34 @@ export class StreamInput {
 
         trySendChannel(this.mouseClicks, this.buffer)
     }
+    private scrollRemainderX = 0
+    private scrollRemainderY = 0
+
+    private resetScrollRemainder() {
+        this.scrollRemainderX = 0
+        this.scrollRemainderY = 0
+    }
+    private sendAccumulatedScroll(deltaX: number, deltaY: number) {
+        this.scrollRemainderX += deltaX
+        this.scrollRemainderY += deltaY
+
+        const integerX = Math.trunc(this.scrollRemainderX)
+        const integerY = Math.trunc(this.scrollRemainderY)
+
+        if (integerX == 0 && integerY == 0) {
+            return
+        }
+
+        this.scrollRemainderX -= integerX
+        this.scrollRemainderY -= integerY
+
+        if (this.config.mouseScrollMode == "highres") {
+            this.sendMouseWheelHighRes(integerX, integerY)
+        } else if (this.config.mouseScrollMode == "normal") {
+            this.sendMouseWheel(integerX, integerY)
+        }
+    }
+
     sendMouseWheelHighRes(deltaX: number, deltaY: number) {
         this.buffer.reset()
 
@@ -337,6 +376,9 @@ export class StreamInput {
     }> = new Map()
     private touchMouseAction: "default" | "scroll" | "screenKeyboard" = "default"
     private primaryTouch: number | null = null
+    // Set when the current gesture has been consumed by a multi-touch action.
+    // Prevents the remaining finger from producing a phantom click.
+    private touchGestureSuppressClick: boolean = false
 
     private onTouchMessage(event: MessageEvent) {
         const data = event.data
@@ -377,6 +419,10 @@ export class StreamInput {
     }
 
     onTouchStart(event: TouchEvent, rect: DOMRect) {
+        if (this.touchTracker.size == 0) {
+            this.touchGestureSuppressClick = false
+        }
+
         for (const touch of event.changedTouches) {
             this.updateTouchTracker(touch)
         }
@@ -397,6 +443,8 @@ export class StreamInput {
                 const primaryTouch = this.touchTracker.get(this.primaryTouch)
                 if (primaryTouch && !primaryTouch.mouseMoved && !primaryTouch.mouseClicked) {
                     this.touchMouseAction = "scroll"
+                    this.touchGestureSuppressClick = true
+                    this.resetScrollRemainder()
 
                     if (this.config.touchMode == "pointAndDrag") {
                         let middleX = 0;
@@ -415,6 +463,7 @@ export class StreamInput {
                 }
             } else if (this.touchTracker.size == 3) {
                 this.touchMouseAction = "screenKeyboard"
+                this.touchGestureSuppressClick = true
             }
         }
     }
@@ -476,9 +525,15 @@ export class StreamInput {
                 } else if (this.touchMouseAction == "scroll") {
                     // inverting horizontal scroll
                     if (this.config.mouseScrollMode == "highres") {
-                        this.sendMouseWheelHighRes(-movementX * TOUCH_HIGH_RES_SCROLL_MULTIPLIER, movementY * TOUCH_HIGH_RES_SCROLL_MULTIPLIER)
+                        this.sendAccumulatedScroll(
+                            -movementX * TOUCH_HIGH_RES_SCROLL_MULTIPLIER,
+                            movementY * TOUCH_HIGH_RES_SCROLL_MULTIPLIER
+                        )
                     } else if (this.config.mouseScrollMode == "normal") {
-                        this.sendMouseWheel(-movementX * TOUCH_SCROLL_MULTIPLIER, movementY * TOUCH_SCROLL_MULTIPLIER)
+                        this.sendAccumulatedScroll(
+                            -movementX * TOUCH_SCROLL_MULTIPLIER,
+                            movementY * TOUCH_SCROLL_MULTIPLIER
+                        )
                     }
                 } else if (this.touchMouseAction == "screenKeyboard") {
                     const distanceY = touch.clientY - oldTouch.originY
@@ -520,7 +575,7 @@ export class StreamInput {
                     const time = this.calcTouchTime(oldTouch)
                     const distance = this.calcTouchOriginDistance(touch, oldTouch)
 
-                    if (this.touchMouseAction == "default") {
+                    if (this.touchMouseAction == "default" && !this.touchGestureSuppressClick) {
                         if (distance <= TOUCH_AS_CLICK_MAX_DISTANCE) {
                             if (time <= TOUCH_AS_CLICK_MAX_TIME_MS || oldTouch.mouseClicked) {
                                 if (this.config.touchMode == "pointAndDrag" && !oldTouch.mouseMoved) {
@@ -546,10 +601,36 @@ export class StreamInput {
         for (const touch of event.changedTouches) {
             this.touchTracker.delete(touch.identifier)
         }
+
+        if (this.touchMouseAction == "scroll" && this.touchTracker.size < 2) {
+            this.touchMouseAction = "default"
+            this.resetScrollRemainder()
+        }
+
+        if (this.touchTracker.size == 0) {
+            this.touchGestureSuppressClick = false
+        }
     }
 
     onTouchCancel(event: TouchEvent, rect: DOMRect) {
-        this.onTouchEnd(event, rect)
+        if (this.config.touchMode == "touch") {
+            for (const touch of event.changedTouches) {
+                this.sendTouch(2, touch, rect)
+            }
+        } else {
+            for (const trackedTouch of this.touchTracker.values()) {
+                if (trackedTouch.mouseClicked) {
+                    this.sendMouseButton(false, StreamMouseButton.LEFT)
+                    trackedTouch.mouseClicked = false
+                }
+            }
+        }
+
+        this.touchTracker.clear()
+        this.primaryTouch = null
+        this.touchMouseAction = "default"
+        this.touchGestureSuppressClick = false
+        this.resetScrollRemainder()
     }
 
     private calcNormalizedPosition(clientX: number, clientY: number, rect: DOMRect): [number, number] | null {
@@ -606,21 +687,31 @@ export class StreamInput {
         }
     }
 
-    private collectActuators(gamepad: Gamepad): Array<GamepadHapticActuator> {
-        const actuators = []
-        if ("vibrationActuator" in gamepad && gamepad.vibrationActuator) {
-            actuators.push(gamepad.vibrationActuator)
-        }
-        if ("hapticActuators" in gamepad && gamepad.hapticActuators) {
-            const hapticActuators = gamepad.hapticActuators as Array<GamepadHapticActuator>
-            actuators.push(...hapticActuators)
-        }
-        return actuators
-    }
-
     private gamepads: Map<number, { internalId: number; gamepadId: string; vendorId: string | null; isVirtual: boolean }> = new Map() // Maps gamepad.index to metadata
     private pendingGamepads: Map<number, { gamepadId: string; vendorId: string | null; isVirtual: boolean; connectedAt: number }> = new Map()
-    private gamepadRumbleInterval: number | null = null
+    private pendingGamepadTimerId: ReturnType<typeof setInterval> | null = null  // 500ms timer for pending promotion
+
+    /** True when there are gamepads that need polling (registered or pending). */
+    hasGamepads(): boolean {
+        return this.gamepads.size > 0 || this.pendingGamepads.size > 0
+    }
+
+    /** True when there's an active touch being tracked (for point-and-drag hold detection). */
+    hasPrimaryTouch(): boolean {
+        // onTouchUpdate work is only relevant in point-and-drag mode.
+        if (this.config.touchMode !== "pointAndDrag") {
+            return false
+        }
+        if (this.primaryTouch == null) {
+            return false
+        }
+        // Guard against stale primaryTouch ids if a browser drops touchend/cancel.
+        if (!this.touchTracker.has(this.primaryTouch)) {
+            this.primaryTouch = null
+            return false
+        }
+        return true
+    }
 
     private getGamepadVendorId(gamepadOrId: Gamepad | string): string | null {
         const id = typeof gamepadOrId === "string" ? gamepadOrId : (gamepadOrId.id || "")
@@ -668,31 +759,7 @@ export class StreamInput {
         this.pendingGamepads.delete(gamepad.index)
         this.addDebugLog(`Connected "${gamepad.id}" at index ${gamepad.index} with internal ID ${id}, total: ${this.gamepads.size}, map keys: ${Array.from(this.gamepads.keys()).join(', ')}`)
 
-        if (this.gamepadRumbleInterval == null) {
-            this.gamepadRumbleInterval = window.setInterval(this.onGamepadRumbleInterval.bind(this), CONTROLLER_RUMBLE_INTERVAL_MS - 10)
-        }
-
-        this.gamepadRumbleCurrent[id] = { lowFrequencyMotor: 0, highFrequencyMotor: 0, leftTrigger: 0, rightTrigger: 0 }
-
         let capabilities = 0
-        for (const actuator of this.collectActuators(gamepad)) {
-            if ("effects" in actuator) {
-                const supportedEffects = actuator.effects as Array<string>
-                for (const effect of supportedEffects) {
-                    if (effect == "dual-rumble") {
-                        capabilities = StreamControllerCapabilities.CAPABILITY_RUMBLE
-                    } else if (effect == "trigger-rumble") {
-                        capabilities = StreamControllerCapabilities.CAPABILITY_TRIGGER_RUMBLE
-                    }
-                }
-            } else if ("type" in actuator && (actuator.type == "vibration" || actuator.type == "dual-rumble")) {
-                capabilities = StreamControllerCapabilities.CAPABILITY_RUMBLE
-            } else if ("playEffect" in actuator && typeof actuator.playEffect == "function") {
-                capabilities = StreamControllerCapabilities.CAPABILITY_RUMBLE | StreamControllerCapabilities.CAPABILITY_TRIGGER_RUMBLE
-            } else if ("pulse" in actuator && typeof actuator.pulse == "function") {
-                capabilities = StreamControllerCapabilities.CAPABILITY_RUMBLE
-            }
-        }
 
         this.sendControllerAdd(id, SUPPORTED_BUTTONS, capabilities)
 
@@ -815,7 +882,7 @@ export class StreamInput {
     }
 
     onGamepadConnect(gamepad: Gamepad) {
-        if (!this.connected) {
+        if (!this.connected || !this.controllers || this.controllers.readyState != "open") {
             this.bufferedControllers.push(gamepad.index)
             this.addDebugLog(`Buffering gamepad at index ${gamepad.index}: ${gamepad.id}`)
             return
@@ -856,7 +923,7 @@ export class StreamInput {
         //  - Physical connects: evict any recently-connected virtual from pendingGamepads
         //    so it can never be promoted.
         if (mode === "auto") {
-            const now = performance.now()
+            const now = Date.now()
             if (isVirtual) {
                 // Reject this virtual only if a physical with the same vendor ID is
                 // already pending or registered AND connected within the suppression window.
@@ -889,10 +956,30 @@ export class StreamInput {
             gamepadId: gamepad.id,
             vendorId,
             isVirtual,
-            connectedAt: performance.now()
+            connectedAt: Date.now()
         })
+        this.ensurePendingGamepadTimer()
         this.addDebugLog(`Queued gamepad pending activation at index ${gamepad.index}: ${gamepad.id}`)
     }
+
+    /** Start a 500ms timer to promote pending gamepads. Off the hot 60Hz path. */
+    private ensurePendingGamepadTimer() {
+        if (this.pendingGamepadTimerId != null) return
+        this.pendingGamepadTimerId = setInterval(() => {
+            if (this.pendingGamepads.size === 0) {
+                clearInterval(this.pendingGamepadTimerId!)
+                this.pendingGamepadTimerId = null
+                return
+            }
+            const gamepads = navigator.getGamepads()
+            this.processPendingGamepads(gamepads)
+            if (this.pendingGamepads.size === 0) {
+                clearInterval(this.pendingGamepadTimerId!)
+                this.pendingGamepadTimerId = null
+            }
+        }, 500)
+    }
+
     onGamepadDisconnect(event: GamepadEvent) {
         const index = event.gamepad.index
         if (this.pendingGamepads.has(index)) {
@@ -906,16 +993,28 @@ export class StreamInput {
     }
     onGamepadUpdate() {
         const gamepads = navigator.getGamepads()
-        this.processPendingGamepads(gamepads)
         if (this.gamepads.size === 0) return
+
+        // Fast path for single registered gamepad (most common case):
+        // avoid array allocation, sort, and dedup entirely.
+        if (this.gamepads.size === 1) {
+            const [index, entry] = this.gamepads.entries().next().value!
+            const gamepad = gamepads[index]
+            if (!gamepad || gamepad.id !== entry.gamepadId) return
+            const state = extractGamepadState(gamepad, this.config.controllerConfig, this.scratchState)
+            if (this.previousStates[entry.internalId] && this.areGamepadStatesEqual(this.previousStates[entry.internalId], state)) return
+            this.previousStates[entry.internalId] = { ...state }
+            this.sendController(entry.internalId, state)
+            return
+        }
+
+        // Multi-gamepad path (rare): full dedup logic
         const pendingUpdates: Array<{
             internalId: number
             gamepadId: string
             timestamp: number
             state: GamepadState
         }> = []
-        
-        if (this.gamepads.size === 0) return
         
         for (const [index, entry] of this.gamepads.entries()) {
             try {
@@ -969,6 +1068,8 @@ export class StreamInput {
                 console.error("[Input]: Error processing gamepad update", e)
             }
         }
+
+        if (pendingUpdates.length === 0) return
 
         // Tesla browser can expose mirrored gamepads for one physical press.
         // Prefer non-virtual pads and suppress mirrored virtual duplicates per poll.
@@ -1050,122 +1151,9 @@ export class StreamInput {
     }
 
     private onControllerMessage(event: MessageEvent) {
-        if (!(event.data instanceof ArrayBuffer)) {
-            return
-        }
-        const buffer = new ByteBuffer(new Uint8Array(event.data))
-
-        const ty = buffer.getU8()
-        if (ty == 0) {
-            // Rumble
-            const id = buffer.getU8()
-            const lowFrequencyMotor = buffer.getU16() / U16_MAX
-            const highFrequencyMotor = buffer.getU16() / U16_MAX
-
-            const gamepadIndex = this.getGamepadIndex(id)
-            if (gamepadIndex == undefined) {
-                return
-            }
-
-            this.setGamepadEffect(id, "dual-rumble", { lowFrequencyMotor, highFrequencyMotor })
-        } else if (ty == 1) {
-            // Trigger Rumble
-            const id = buffer.getU8()
-            const leftTrigger = buffer.getU16() / U16_MAX
-            const rightTrigger = buffer.getU16() / U16_MAX
-
-            const gamepadIndex = this.getGamepadIndex(id)
-            if (gamepadIndex == undefined) {
-                return
-            }
-
-            this.setGamepadEffect(id, "trigger-rumble", { leftTrigger, rightTrigger })
-        }
-    }
-
-    // -- Controller rumble
-    private gamepadRumbleCurrent: Array<{
-        lowFrequencyMotor: number, highFrequencyMotor: number,
-        leftTrigger: number, rightTrigger: number
-    }> = []
-
-    private setGamepadEffect(id: number, ty: "dual-rumble", params: { lowFrequencyMotor: number, highFrequencyMotor: number }): void
-    private setGamepadEffect(id: number, ty: "trigger-rumble", params: { leftTrigger: number, rightTrigger: number }): void
-
-    private setGamepadEffect(id: number, _ty: "dual-rumble" | "trigger-rumble", params: { lowFrequencyMotor: number, highFrequencyMotor: number } | { leftTrigger: number, rightTrigger: number }) {
-        const rumble = this.gamepadRumbleCurrent[id]
-
-        Object.assign(rumble, params)
-    }
-
-    private onGamepadRumbleInterval() {
-        for (const [index, entry] of this.gamepads.entries()) {
-            const rumble = this.gamepadRumbleCurrent[entry.internalId]
-            const gamepad = navigator.getGamepads()[index]
-            if (gamepad && rumble) {
-                this.refreshGamepadRumble(rumble, gamepad)
-            }
-        }
-    }
-    private refreshGamepadRumble(
-        rumble: {
-            lowFrequencyMotor: number, highFrequencyMotor: number,
-            leftTrigger: number, rightTrigger: number
-        },
-        gamepad: Gamepad
-    ) {
-        // Browsers are making this more complicated than it is
-
-        const actuators = this.collectActuators(gamepad)
-
-        for (const actuator of actuators) {
-            if ("effects" in actuator) {
-                const supportedEffects = actuator.effects as Array<string>
-
-                for (const effect of supportedEffects) {
-                    if (effect == "dual-rumble") {
-                        actuator.playEffect("dual-rumble", {
-                            duration: CONTROLLER_RUMBLE_INTERVAL_MS,
-                            weakMagnitude: rumble.lowFrequencyMotor,
-                            strongMagnitude: rumble.highFrequencyMotor
-                        }).catch(() => {})
-                    } else if (effect == "trigger-rumble") {
-                        actuator.playEffect("trigger-rumble", {
-                            duration: CONTROLLER_RUMBLE_INTERVAL_MS,
-                            leftTrigger: rumble.leftTrigger,
-                            rightTrigger: rumble.rightTrigger
-                        }).catch(() => {})
-                    }
-                }
-            } else if ("type" in actuator && (actuator.type == "vibration" || actuator.type == "dual-rumble")) {
-                actuator.playEffect(actuator.type as any, {
-                    duration: CONTROLLER_RUMBLE_INTERVAL_MS,
-                    weakMagnitude: rumble.lowFrequencyMotor,
-                    strongMagnitude: rumble.highFrequencyMotor
-                }).catch(() => {})
-            } else if ("playEffect" in actuator && typeof actuator.playEffect == "function") {
-                actuator.playEffect("dual-rumble", {
-                    duration: CONTROLLER_RUMBLE_INTERVAL_MS,
-                    weakMagnitude: rumble.lowFrequencyMotor,
-                    strongMagnitude: rumble.highFrequencyMotor
-                }).catch(() => {})
-                actuator.playEffect("trigger-rumble", {
-                    duration: CONTROLLER_RUMBLE_INTERVAL_MS,
-                    leftTrigger: rumble.leftTrigger,
-                    rightTrigger: rumble.rightTrigger
-                }).catch(() => {})
-            } else if ("pulse" in actuator && typeof actuator.pulse == "function") {
-                const weak = Math.min(Math.max(rumble.lowFrequencyMotor, 0), 1);
-                const strong = Math.min(Math.max(rumble.highFrequencyMotor, 0), 1);
-
-                const average = (weak + strong) / 2.0
-
-                const promise = actuator.pulse(average, CONTROLLER_RUMBLE_INTERVAL_MS)
-                if (promise && typeof promise.catch == "function") {
-                    promise.catch(() => {})
-                }
-            }
-        }
+        // Rumble messages from the host are ignored on Tesla — the Bluetooth HID
+        // playEffect() API causes main-thread stalls that produce video micro-stutter.
+        // Messages are silently consumed to avoid errors.
     }
 
     // -- Controller Sending

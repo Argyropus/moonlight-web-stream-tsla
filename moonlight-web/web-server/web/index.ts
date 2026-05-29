@@ -1,3 +1,4 @@
+import "./polyfill/index.js"
 import { Api, getApi, apiPutHost, FetchError } from "./api.js";
 import { AddHostModal } from "./component/host/add_modal.js";
 import { HostList } from "./component/host/list.js";

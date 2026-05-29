@@ -16,6 +16,8 @@ type WorkerDiagnosticsSnapshot = {
         rafMissedFrames: number
         drawnFrameCount: number
         arrivedCount: number
+        supersededCount: number
+        jumpCount: number
         minGapMs: number
         avgGapMs: number
         maxGapMs: number
@@ -71,9 +73,29 @@ export class StreamStatsOverlay implements Component {
     private prevFramesAssembled = 0
     private prevJitterBufferDelay = 0
     private prevJitterBufferEmittedCount = 0
+    private prevCanvasArrivedCount = 0
 
     constructor() {
         this.root.classList.add("stream-stats-overlay")
+
+        // Header with refresh button — stats are on-demand only to avoid
+        // peer.getStats() mutex locks that cause micro-stutter.
+        const header = document.createElement("div")
+        header.classList.add("stream-stats-row")
+        header.style.cursor = "pointer"
+        header.style.userSelect = "none"
+        header.style.opacity = "0.8"
+        header.style.textAlign = "center"
+        header.textContent = "[ tap to refresh stats ]"
+        header.addEventListener("click", (e) => {
+            e.stopPropagation()
+            this.scheduleUpdate()
+        })
+        header.addEventListener("touchend", (e) => {
+            e.stopPropagation()
+            this.scheduleUpdate()
+        })
+        this.root.appendChild(header)
 
         const rows: Array<[string, HTMLSpanElement]> = [
             ["Resolution", this.elVideoRes],
@@ -129,9 +151,10 @@ export class StreamStatsOverlay implements Component {
 
     show() {
         this.root.style.display = ""
-        if (!this.intervalId) {
-            this.intervalId = setInterval(() => this.update(), 1000)
-        }
+        // On-demand only: do one initial refresh when shown, then user taps to refresh.
+        // No periodic polling — peer.getStats() locks internal WebRTC mutexes
+        // which stall the RTP receive thread and cause micro-stutter.
+        this.scheduleUpdate()
     }
 
     hide() {
@@ -146,18 +169,38 @@ export class StreamStatsOverlay implements Component {
         return this.root.style.display !== "none"
     }
 
+    private statsProcessingMs: number = 0
+    private updatePending = false
+
+    private scheduleUpdate() {
+        if (this.updatePending) return
+        this.updatePending = true
+        // Use requestIdleCallback if available (not in all workers/old browsers)
+        if (typeof (globalThis as any).requestIdleCallback === "function") {
+            ;(globalThis as any).requestIdleCallback(() => {
+                this.updatePending = false
+                this.update()
+            }, { timeout: 2000 })
+        } else {
+            // Fallback: setTimeout with a small delay to yield to the current frame
+            setTimeout(() => {
+                this.updatePending = false
+                this.update()
+            }, 50)
+        }
+    }
+
     private async update() {
         const peer = this.peerGetter?.()
         if (!peer) return
 
         const stats = await peer.getStats()
-        const now = performance.now()
+        const now = Date.now()
         const elapsed = (now - this.prevTimestamp) / 1000 // seconds
         this.prevTimestamp = now
 
         let videoWidth = 0
         let videoHeight = 0
-        let codecId = ""
         let bytesReceived = 0
         let framesReceived = 0
         let framesDropped = 0
@@ -181,13 +224,10 @@ export class StreamStatsOverlay implements Component {
         let jitterBufferEmittedCount = 0
         let jitterBufferMinimumDelay = 0
 
-        // Collect all reports into a map for two-pass lookups
-        const reports: Map<string, any> = new Map()
+        // Single-pass direct iteration — no intermediate Map allocation.
+        // Codec is resolved inline since RTCStatsReport.get() does the lookup for us.
+        let codec = ""
         stats.forEach((report: any) => {
-            reports.set(report.id, report)
-        })
-
-        for (const report of reports.values()) {
             if (report.type === "inbound-rtp" && report.kind === "video") {
                 bytesReceived = report.bytesReceived ?? 0
                 framesReceived = report.framesReceived ?? 0
@@ -196,7 +236,6 @@ export class StreamStatsOverlay implements Component {
                 totalDecodeTime = report.totalDecodeTime ?? 0
                 framesDecoded = report.framesDecoded ?? 0
                 jitter = report.jitter ?? 0
-                codecId = report.codecId ?? ""
                 packetsReceived = report.packetsReceived ?? 0
                 packetsLost = report.packetsLost ?? 0
                 nackCount = report.nackCount ?? 0
@@ -209,33 +248,24 @@ export class StreamStatsOverlay implements Component {
                 jitterBufferDelay = report.jitterBufferDelay ?? 0
                 jitterBufferEmittedCount = report.jitterBufferEmittedCount ?? 0
                 jitterBufferMinimumDelay = report.jitterBufferMinimumDelay ?? 0
-
                 if (report.frameWidth && report.frameHeight) {
                     videoWidth = report.frameWidth
                     videoHeight = report.frameHeight
                 }
-            }
-
-            if (report.type === "data-channel" && report.label === "audio") {
+                // Resolve codec inline via RTCStatsReport.get()
+                if (report.codecId) {
+                    const codecReport = stats.get(report.codecId)
+                    if (codecReport) codec = codecReport.mimeType ?? ""
+                }
+            } else if (report.type === "data-channel" && report.label === "audio") {
                 audioBytesReceived = report.bytesReceived ?? 0
                 audioMessagesReceived = report.messagesReceived ?? 0
-            }
-
-            if (report.type === "candidate-pair" && (report.state === "succeeded" || report.nominated)) {
+            } else if (report.type === "candidate-pair" && (report.state === "succeeded" || report.nominated)) {
                 rtt = report.currentRoundTripTime ?? rtt
             }
-        }
+        })
 
-        // Resolve codec in second pass (codecId may reference another report)
-        let codec = ""
-        if (codecId) {
-            const codecReport = reports.get(codecId)
-            if (codecReport) {
-                codec = codecReport.mimeType ?? ""
-            }
-        }
-
-        // Calculate deltas
+        // Calculate deltas (all rates are per-second regardless of update interval)
         if (elapsed > 0) {
             const videoBitrateMbps = ((bytesReceived - this.prevBytesReceived) * 8) / elapsed / 1_000_000
             this.elBitrate.textContent = `${videoBitrateMbps.toFixed(2)} Mbps`
@@ -246,8 +276,9 @@ export class StreamStatsOverlay implements Component {
             const audioMessageDelta = audioMessagesReceived - this.prevAudioMessagesReceived
             const audioBytesDelta = audioBytesReceived - this.prevAudioBytesReceived
             const avgBytesPerMessage = audioMessageDelta > 0 ? (audioBytesDelta / audioMessageDelta) : 0
+            const audioMsgPerSec = Math.round(audioMessageDelta / elapsed)
             this.elAudioPackets.textContent = audioMessageDelta >= 0
-                ? `${audioMessageDelta}/s (${avgBytesPerMessage.toFixed(1)} B/msg, ${audioMessagesReceived} total)`
+                ? `${audioMsgPerSec}/s (${avgBytesPerMessage.toFixed(1)} B/msg, ${audioMessagesReceived} total)`
                 : `${audioMessagesReceived} total`
 
             const droppedDelta = framesDropped - this.prevFramesDropped
@@ -256,12 +287,12 @@ export class StreamStatsOverlay implements Component {
             const nackDelta = nackCount - this.prevNackCount
             const pliDelta  = pliCount  - this.prevPliCount
             const keyDelta  = keyFramesDecoded - this.prevKeyFramesDecoded
-            this.elNackPli.textContent = `NACK ${nackDelta}/s, PLI ${pliDelta}/s, keyframes ${keyDelta}/s (${keyFramesDecoded} total)`
+            this.elNackPli.textContent = `NACK ${Math.round(nackDelta / elapsed)}/s, PLI ${Math.round(pliDelta / elapsed)}/s, keyframes ${Math.round(keyDelta / elapsed)}/s (${keyFramesDecoded} total)`
 
             const assembledDelta = framesAssembledFromMultiplePackets - this.prevFramesAssembled
             const assemblyTimeDelta = totalAssemblyTime - this.prevTotalAssemblyTime
             const avgAssemblyMs = assembledDelta > 0 ? (assemblyTimeDelta / assembledDelta * 1000) : 0
-            this.elAssembly.textContent = `${assembledDelta}/s multi-pkt, avg ${avgAssemblyMs.toFixed(1)} ms`
+            this.elAssembly.textContent = `${Math.round(assembledDelta / elapsed)}/s multi-pkt, avg ${avgAssemblyMs.toFixed(1)} ms`
 
             const totalPacketsDelta = (packetsReceived - this.prevPacketsReceived) + (packetsLost - this.prevPacketsLost)
             const lostDelta = packetsLost - this.prevPacketsLost
@@ -324,9 +355,14 @@ export class StreamStatsOverlay implements Component {
                     const modeLabel = c.videoElementMode ? "vidElem" : (c.active ? "worker" : "main")
                     const dropLabel = c.active ? "dropped" : "rafMiss"
                     const gapStr = c.minGapMs >= 0
-                        ? ` gaps: ${c.minGapMs.toFixed(1)}/${c.avgGapMs.toFixed(1)}/${c.maxGapMs.toFixed(1)} ms (min/avg/max)`
+                        ? `, gaps: ${c.minGapMs.toFixed(1)}/${c.avgGapMs.toFixed(1)}/${c.maxGapMs.toFixed(1)} ms`
                         : ""
-                    this.elWorkerVideo.textContent = `mode=${modeLabel}, arrived=${c.arrivedCount}/s, drawn=${c.drawnFrameCount}, ${dropLabel}=${c.rafMissedFrames}${gapStr}, err=${c.error ?? "none"}`
+                    const srcGapStr = (c as any).srcGapMs ? `, src: ${(c as any).srcGapMs} ms` : ""
+                    const supersededStr = c.supersededCount > 0 ? `, skip=${c.supersededCount}` : ""
+                    const jumpsStr = c.jumpCount > 0 ? `, jumps=${c.jumpCount}` : ""
+                    const arrivedRate = elapsed > 0 ? Math.round((c.arrivedCount - this.prevCanvasArrivedCount) / elapsed) : 0
+                    this.prevCanvasArrivedCount = c.arrivedCount
+                    this.elWorkerVideo.textContent = `mode=${modeLabel}, arrived=${arrivedRate}/s, drawn=${c.drawnFrameCount}, ${dropLabel}=${c.rafMissedFrames}${supersededStr}${jumpsStr}${gapStr}${srcGapStr}, err=${c.error ?? "none"}`
                 } else {
                     this.elWorkerVideo.textContent = "canvas diagnostics unavailable"
                 }

@@ -9,6 +9,7 @@ import Module from "./opus-stream-decoder.mjs"
 type AudioDecodeWorkerInMessage =
     | { type: "init" }
     | { type: "decode"; packet: ArrayBuffer }
+    | { type: "decodeBatch"; packets: ArrayBuffer[] }
     | { type: "free" }
 
 type AudioDecodeWorkerOutMessage =
@@ -114,12 +115,25 @@ export class Stream {
     private decoderInitInFlight: boolean = false
     private audioDecoderReady: boolean = false
     private nextAudioTime: number = 0
-    private sourceNodes: Set<AudioBufferSourceNode> = new Set()
-    // Pool of reusable AudioBuffers; since all audio chunks have the same length
-    // (fixed samples_per_frame from stream config) we can safely recycle them
-    // after their source node has finished playing, eliminating per-chunk allocations.
-    private audioBufferPool: AudioBuffer[] = []
+    private audioContextInterrupted: boolean = false
+    // AudioWorkletNode for stutter-free playback: its process() runs on the
+    // real-time audio rendering thread, immune to main-thread congestion.
+    private audioWorkletNode: AudioWorkletNode | null = null
+    private audioWorkletReady: boolean = false
     private isFirstAudioPacket: boolean = true
+    private workletBufferMs: number = 0
+    // PCM buffer recycling: collect used ArrayBuffers and return to worker in batches
+    private pcmRecycleQueue: ArrayBuffer[] = []
+    private pcmRecycleScheduled: boolean = false
+    private readonly PCM_RECYCLE_BATCH = 8
+    // Ring buffer for main-thread audio decode path (avoids push/shift GC churn).
+    // Worker path bypasses this entirely — packets go directly via postMessage transfer.
+    private audioRingBuffer: (ArrayBuffer | null)[] = new Array(128).fill(null)
+    private audioRingHead: number = 0   // next write index
+    private audioRingTail: number = 0   // next read index
+    private audioRingMask: number = 127 // capacity - 1 (power of 2)
+    private audioDrainScheduled: boolean = false
+    private readonly AUDIO_DRAIN_BATCH_SIZE = 4 // max packets per drain tick
     private audioPacketsReceived: number = 0
     private audioPacketsDecoded: number = 0
     private audioBytesReceived: number = 0
@@ -134,6 +148,8 @@ export class Stream {
     private audioAvgPacketGapMs: number = 0
     private audioMaxPacketGapMs: number = 0
     private audioLatePacketGaps: number = 0
+    private audioGapSampleCounter: number = 0
+    private readonly AUDIO_GAP_SAMPLE_EVERY = 8
 
     constructor(api: Api, hostId: number, appId: number, settings: StreamSettings, supportedVideoFormats: VideoCodecSupport, viewerScreenSize: [number, number]) {
         this.api = api
@@ -265,10 +281,16 @@ export class Stream {
                     this.decoderInitInFlight = false
                     this.audioDecodeWorkerInitError = null
                     this.debugLog("Audio decode worker ready")
+                    // If worklet is already ready, wire direct channel now
+                    if (this.audioWorkletReady) {
+                        this.wireDirectAudioChannel();
+                    }
                     return
                 }
 
                 if (data.type === "decoded") {
+                    // This path only fires during startup before direct channel is wired.
+                    // Once wireDirectAudioChannel() is called, worker sends directly to worklet.
                     const left = new Float32Array(data.left)
                     const right = new Float32Array(data.right)
                     this.playPcm(left, right)
@@ -344,18 +366,18 @@ export class Stream {
             // Force 48kHz to match Opus native rate and avoid resampling artifacts
             this.audioContext = new AudioContext({ sampleRate: 48000 });
             
-            // Gain node to boost volume to match car audio levels
+            // Gain node to boost volume so Tesla system volume can stay low
+            // (prevents radio/Spotify from blowing speakers if it auto-resumes)
             this.mainGainNode = this.audioContext.createGain();
-            this.mainGainNode.gain.value = 3.5;
+            this.mainGainNode.gain.value = 5.0;
 
             // Compressor acting as a limiter to prevent clipping distortion
-            // This allows high gain without the harsh noise/humming from signal clipping
             const compressor = this.audioContext.createDynamicsCompressor();
-            compressor.threshold.value = -3;   // Start limiting 3dB below max
-            compressor.knee.value = 3;          // Gentle knee for smoother limiting
-            compressor.ratio.value = 20;        // High ratio = hard limiter
-            compressor.attack.value = 0.001;    // Fast attack to catch transients
-            compressor.release.value = 0.05;    // Quick release to avoid pumping
+            compressor.threshold.value = -3;
+            compressor.knee.value = 3;
+            compressor.ratio.value = 20;
+            compressor.attack.value = 0.001;
+            compressor.release.value = 0.05;
 
             // Low-pass filter to cut high-frequency noise/aliasing artifacts
             const lpFilter = this.audioContext.createBiquadFilter();
@@ -363,16 +385,61 @@ export class Stream {
             lpFilter.frequency.value = 20000;
             lpFilter.Q.value = 0.7;
 
-            // Chain: source -> gain -> compressor/limiter -> lowpass -> destination
+            // Chain: workletNode -> gain -> compressor -> lowpass -> destination
             this.mainGainNode.connect(compressor);
             compressor.connect(lpFilter);
             lpFilter.connect(this.audioContext.destination);
+
+            // Register AudioWorklet for real-time-thread audio rendering.
+            // This is the key to stutter-free playback: process() runs on the
+            // audio rendering thread, not the main thread.
+            this.audioContext.audioWorklet.addModule(
+                new URL("./audio_playback_worklet.js", import.meta.url).href
+            ).then(() => {
+                if (!this.audioContext) return;
+                this.audioWorkletNode = new AudioWorkletNode(this.audioContext, 'pcm-playback-processor', {
+                    numberOfInputs: 0,
+                    numberOfOutputs: 1,
+                    outputChannelCount: [2],
+                });
+                this.audioWorkletNode.connect(this.mainGainNode!);
+                this.audioWorkletReady = true;
+
+                // Listen for stats from worklet
+                this.audioWorkletNode.port.onmessage = (event: MessageEvent) => {
+                    if (event.data?.type === 'stats') {
+                        this.workletBufferMs = event.data.bufferMs;
+                        this.audioUnderruns = event.data.underruns;
+                    }
+                };
+
+                // Wire direct MessageChannel: decode worker → worklet
+                // This removes the main thread from the decoded PCM hot path entirely.
+                this.wireDirectAudioChannel();
+
+                this.debugLog("AudioWorklet playback processor ready");
+            }).catch((e) => {
+                console.error("AudioWorklet registration failed:", e);
+                this.debugLog(`AudioWorklet failed: ${e}`);
+            });
+
+            if (this.settings.keepAudioAlive) {
+                const keepaliveOsc = this.audioContext.createOscillator();
+                const keepaliveGain = this.audioContext.createGain();
+                keepaliveOsc.frequency.value = 0.5;
+                keepaliveGain.gain.value = 0.00001;
+                keepaliveOsc.connect(keepaliveGain);
+                keepaliveGain.connect(this.audioContext.destination);
+                keepaliveOsc.start();
+            }
 
             this.monitorAudioContext();
         } catch (e) {
             console.error("Failed to create AudioContext", e);
         }
     }
+
+
     
     private monitorAudioContext() {
         if (this.audioContext) {
@@ -380,106 +447,79 @@ export class Stream {
                  const state = this.audioContext?.state;
                  console.log(`[AudioContext] state change: ${state}`);
                  this.debugLog(`AudioContext state: ${state}`);
+                 if (state !== 'running') {
+                     // Mark interrupted so the next packet resyncs nextAudioTime.
+                     // Without this, packets arriving during suspension advance
+                     // nextAudioTime while currentTime is frozen, causing a 300ms+
+                     // latency burst and a flood of HARD_OVERRUN drops on resume.
+                     this.audioContextInterrupted = true;
+                 }
              };
         }
     }
 
-    private playPcm(left: Float32Array, right: Float32Array) {
-        if (!this.audioContext) return;
+    private onAudioSourceEnded = (_event: Event) => {
+        // No-op: ScriptProcessorNode handles playback continuously.
+        // Kept for interface compatibility.
+    }
 
-        // Resume context if suspended (autoplay policy)
+    private playPcm(left: Float32Array, right: Float32Array) {
+        if (!this.audioContext || !this.audioWorkletReady || !this.audioWorkletNode) return;
+
         if (this.audioContext.state === 'suspended') {
             this.audioContext.resume();
         }
 
-        const currentTime = this.audioContext.currentTime;
         this.audioPacketsDecoded++;
-        
-        if (this.isFirstAudioPacket) {
-            // Larger initial buffer to allow smooth scheduling and avoid early underruns
-            this.nextAudioTime = currentTime + 0.08;
-            this.isFirstAudioPacket = false;
-        }
 
-        let ahead = this.nextAudioTime - currentTime;
+        // Post PCM data to the AudioWorklet processor's port.
+        // The worklet's process() runs on the real-time audio thread — 
+        // immune to main-thread GC, DataChannel bursts, rAF, etc.
+        // Transfer the underlying ArrayBuffers for zero-copy.
+        this.audioWorkletNode.port.postMessage(
+            { type: 'pcm', left: left.buffer, right: right.buffer },
+            [left.buffer, right.buffer]
+        );
+    }
 
-        // Latency control with two thresholds:
-        // 1) Soft overrun: keep audio continuous and gently catch up by slightly
-        //    increasing playback rate for this chunk.
-        // 2) Hard overrun: drop only this newly decoded chunk as last resort.
-        const SOFT_OVERRUN = 0.15; // 150ms
-        const HARD_OVERRUN = 0.30; // 300ms
-        if (ahead > HARD_OVERRUN) {
-            this.audioDroppedBufferedSources++;
-            this.audioDroppedLatencyFlushes++;
-            return;
-        }
+    private wireDirectAudioChannel() {
+        if (!this.audioDecodeWorker || !this.audioWorkletNode) return;
 
-        if (ahead < -0.02) {
-             // We are behind (underrun), resync with a small buffer
-             this.audioUnderruns++;
-             this.audioResyncs++;
-             this.nextAudioTime = currentTime + 0.04;
-        }
+        // Create a MessageChannel: port1 goes to the decode worker,
+        // port2 goes to the AudioWorklet. Decoded PCM flows directly
+        // worker→worklet without touching the main thread.
+        const channel = new MessageChannel();
 
-        const channels = 2;
-        const frameCount = left.length;
-        const audioBuffer = this.acquireAudioBuffer(channels, frameCount, 48000);
+        // Send port2 to worklet
+        this.audioWorkletNode.port.postMessage(
+            { type: 'pcm-port', port: channel.port2 },
+            [channel.port2]
+        );
 
-        audioBuffer.copyToChannel(left, 0);
-        audioBuffer.copyToChannel(right, 1);
+        // Send port1 to decode worker (it will flush buffered frames and
+        // switch to direct delivery)
+        this.audioDecodeWorker.postMessage(
+            { type: 'pcm-port', port: channel.port1 },
+            [channel.port1]
+        );
 
-        const source = this.audioContext.createBufferSource();
-        source.buffer = audioBuffer;
+        this.debugLog("Direct worker→worklet audio channel established");
+    }
 
-        // Soft catch-up: slightly faster playback drains buffered lead without
-        // abrupt flushes that can produce static/pops.
-        if (ahead > SOFT_OVERRUN) {
-            // Scale 1.0 -> 1.06 between SOFT_OVERRUN and HARD_OVERRUN
-            const t = Math.min(1, (ahead - SOFT_OVERRUN) / (HARD_OVERRUN - SOFT_OVERRUN));
-            source.playbackRate.value = 1.0 + (0.06 * t);
-        }
-
-        if (this.mainGainNode) {
-            source.connect(this.mainGainNode);
-        } else {
-            source.connect(this.audioContext.destination);
-        }
-        
-        source.start(this.nextAudioTime);
-        this.nextAudioTime += audioBuffer.duration / source.playbackRate.value;
-        
-        this.sourceNodes.add(source);
-        source.onended = () => {
-            this.sourceNodes.delete(source);
-            this.releaseAudioBuffer(audioBuffer);
-        };
-
-        // Guard against sourceNodes leak if onended doesn't fire (constrained browsers)
-        if (this.sourceNodes.size > 100) {
-            for (const staleNode of this.sourceNodes) {
-                if (staleNode !== source) {
-                    try { staleNode.stop(); } catch(e) {}
-                    this.sourceNodes.delete(staleNode);
-                    this.audioDroppedBufferedSources++;
-                    this.audioDroppedCleanupSources++;
-                }
-            }
+    private recyclePcmBuffer(buf: ArrayBuffer) {
+        this.pcmRecycleQueue.push(buf)
+        if (!this.pcmRecycleScheduled && this.pcmRecycleQueue.length >= this.PCM_RECYCLE_BATCH) {
+            this.pcmRecycleScheduled = true
+            // Use queueMicrotask to batch without a full event loop turn
+            queueMicrotask(() => this.flushPcmRecycle())
         }
     }
 
-    private acquireAudioBuffer(channels: number, frameCount: number, sampleRate: number): AudioBuffer {
-        const buf = this.audioBufferPool.pop()
-        if (buf && buf.numberOfChannels === channels && buf.length === frameCount) {
-            return buf
-        }
-        return this.audioContext!.createBuffer(channels, frameCount, sampleRate)
-    }
-
-    private releaseAudioBuffer(buf: AudioBuffer) {
-        if (this.audioBufferPool.length < 16) {
-            this.audioBufferPool.push(buf)
-        }
+    private flushPcmRecycle() {
+        this.pcmRecycleScheduled = false
+        if (!this.audioDecodeWorker || this.pcmRecycleQueue.length === 0) return
+        const buffers = this.pcmRecycleQueue.splice(0)
+        this.audioDecodeWorker.postMessage({ type: "recycle", buffers }, buffers)
     }
 
     private debugLog(message: string) {
@@ -514,6 +554,11 @@ export class Stream {
         this.peer.addEventListener("iceconnectionstatechange", this.onIceConnectionStateChange.bind(this))
 
         this.input.setPeer(this.peer)
+
+        // Pre-declare a recvonly video transceiver so the initial offer includes
+        // the video m-line. The streamer has a sendonly track pre-registered
+        // for the same m-line, so no renegotiation is needed after stream start.
+        this.peer.addTransceiver("video", { direction: "recvonly" })
 
         // Maybe we already received data
         if (this.remoteDescription) {
@@ -617,15 +662,27 @@ export class Stream {
     }
 
     // -- Signaling
+    private makingOffer = false
     private async onNegotiationNeeded() {
         if (!this.peer) {
             this.debugLog("OnNegotiationNeeded without a peer")
             return
         }
 
-        await this.peer.setLocalDescription()
+        // If we already have a remote description, the streamer is driving
+        // negotiation — suppress client-initiated offers to avoid glare.
+        if (this.remoteDescription && this.peer.signalingState !== "stable") {
+            this.debugLog("Suppressing client offer — streamer is driving negotiation")
+            return
+        }
 
-        await this.sendLocalDescription()
+        this.makingOffer = true
+        try {
+            await this.peer.setLocalDescription()
+            await this.sendLocalDescription()
+        } finally {
+            this.makingOffer = false
+        }
     }
 
 
@@ -639,11 +696,20 @@ export class Stream {
             return
         }
 
+        // "Polite peer" pattern: if we receive an offer while we have a pending
+        // local offer, rollback ours and accept the remote (streamer is impolite/authoritative).
+        const offerCollision = description.type === "offer" &&
+            (this.makingOffer || this.peer.signalingState !== "stable")
+
+        if (offerCollision) {
+            this.debugLog("Offer collision detected — rolling back local offer (polite peer)")
+            await this.peer.setLocalDescription({ type: "rollback" })
+        }
+
         await this.peer.setRemoteDescription(description)
 
         if (description.type === "offer") {
             await this.peer.setLocalDescription()
-
             await this.sendLocalDescription()
         }
 
@@ -709,19 +775,6 @@ export class Stream {
 
     // -- Track and Data Channels
     private onTrack(event: RTCTrackEvent) {
-        // Jitter buffer target: balance between smoothness and latency.
-        // 0ms = minimum latency but network jitter directly causes frame timing variance (judder).
-        // 10ms = smooths out WiFi jitter (~5-15ms variance) while adding imperceptible latency.
-        // The browser uses this as a TARGET not a minimum — it can still deliver faster when possible.
-        const targetDelay = 20;
-        
-        event.receiver.jitterBufferTarget = targetDelay;
-
-        if ("playoutDelayHint" in event.receiver) {
-            event.receiver.playoutDelayHint = targetDelay / 1000;
-        } else {
-            this.debugLog(`playoutDelayHint not supported in receiver: ${event.receiver.track.label}`)
-        }
 
         if(!this.settings?.canvasRenderer) {
             const stream = event.streams[0]
@@ -771,10 +824,9 @@ export class Stream {
                     message: `Connection state is ${this.peer.connectionState}`
                 }
             })
-
             this.eventTarget.dispatchEvent(customEvent)
         } else if (this.peer.connectionState == "disconnected") {
-            // Transient state on mobile — log but don't show error modal
+            // Transient state — log but don't show error modal; ICE restart is handled by streamer
             this.debugLog("Connection temporarily disconnected, waiting for recovery...")
         } else if (this.peer.connectionState == "connected") {
             // Connection recovered — dismiss any error modal
@@ -787,6 +839,7 @@ export class Stream {
             this.eventTarget.dispatchEvent(customEvent)
         }
     }
+
     private onIceConnectionStateChange() {
         if (!this.peer) {
             this.debugLog("OnIceConnectionStateChange without a peer")
@@ -809,39 +862,69 @@ export class Stream {
     private onAudioDataChannelMessage(event: MessageEvent) {
         if (!this.audioDecoderReady) return;
         this.audioPacketsReceived++;
-        if (event.data && event.data.byteLength) {
-            this.audioBytesReceived += event.data.byteLength;
+
+        // Ensure AudioContext is running (autoplay policy requires user gesture first)
+        if (this.audioContext && this.audioContext.state === 'suspended') {
+            this.audioContext.resume();
         }
 
-        const now = performance.now();
-        if (this.lastAudioPacketAt > 0) {
-            const gapMs = now - this.lastAudioPacketAt;
-            this.audioLastPacketGapMs = gapMs;
-            this.audioMaxPacketGapMs = Math.max(this.audioMaxPacketGapMs, gapMs);
-            if (this.audioAvgPacketGapMs === 0) {
-                this.audioAvgPacketGapMs = gapMs;
-            } else {
-                this.audioAvgPacketGapMs = (this.audioAvgPacketGapMs * 0.9) + (gapMs * 0.1);
+        const packet = event.data as ArrayBuffer;
+        this.audioBytesReceived += packet.byteLength;
+
+        // Sample inter-packet timing every N packets (cheap: integer modulo + branch).
+        if ((++this.audioGapSampleCounter & (this.AUDIO_GAP_SAMPLE_EVERY - 1)) === 0) {
+            const now = event.timeStamp || 0;
+            if (now > 0 && this.lastAudioPacketAt > 0) {
+                const sampledGapMs = (now - this.lastAudioPacketAt) / this.AUDIO_GAP_SAMPLE_EVERY;
+                this.audioLastPacketGapMs = sampledGapMs;
+                if (sampledGapMs > this.audioMaxPacketGapMs) this.audioMaxPacketGapMs = sampledGapMs;
+                this.audioAvgPacketGapMs = this.audioAvgPacketGapMs === 0
+                    ? sampledGapMs
+                    : this.audioAvgPacketGapMs * 0.9 + sampledGapMs * 0.1;
+                if (sampledGapMs > 35) this.audioLatePacketGaps++;
             }
-            if (gapMs > 35) {
-                this.audioLatePacketGaps++;
-            }
+            if (now > 0) this.lastAudioPacketAt = now;
         }
-        this.lastAudioPacketAt = now;
-        
-        try {
-            if (this.useAudioDecodeWorker && this.audioDecodeWorker) {
-                const packet = event.data as ArrayBuffer
-                const msg: AudioDecodeWorkerInMessage = { type: "decode", packet }
-                this.audioDecodeWorker.postMessage(msg, [packet])
-            } else if (this.audioDecoder) {
-                this.audioDecoder.decode(new Uint8Array(event.data))
-            }
-        } catch (e) {
-            this.audioDecodeErrors++;
-            console.error("Error decoding audio", e);
+
+        // Worker path: zero-copy transfer directly from the event callback.
+        // No queue, no intermediate arrays, no setTimeout — just hand the buffer
+        // to the worker thread instantly. This keeps the callback allocation-free.
+        if (this.useAudioDecodeWorker && this.audioDecodeWorker) {
+            this.audioDecodeWorker.postMessage(packet, [packet]);
+            return;
+        }
+
+        // Main-thread fallback: ring buffer + batched drain to avoid blocking rAF.
+        this.audioRingBuffer[this.audioRingHead] = packet;
+        this.audioRingHead = (this.audioRingHead + 1) & this.audioRingMask;
+        if (!this.audioDrainScheduled) {
+            this.audioDrainScheduled = true;
+            this.drainAudioQueue();
         }
     }
+
+    private drainAudioQueue() {
+        let count = 0;
+        while (this.audioRingTail !== this.audioRingHead && count < this.AUDIO_DRAIN_BATCH_SIZE) {
+            const packet = this.audioRingBuffer[this.audioRingTail]!;
+            this.audioRingBuffer[this.audioRingTail] = null; // release ref
+            this.audioRingTail = (this.audioRingTail + 1) & this.audioRingMask;
+            try {
+                this.audioDecoder.decode(new Uint8Array(packet));
+            } catch (e) {
+                this.audioDecodeErrors++;
+            }
+            count++;
+        }
+        if (this.audioRingTail !== this.audioRingHead) {
+            // Yield to the event loop — lets rAF fire between batches
+            setTimeout(() => this.drainAudioQueue(), 0);
+        } else {
+            this.audioDrainScheduled = false;
+        }
+    }
+
+
     private async onGeneralDataChannelMessage(event: MessageEvent) {
         const data = event.data
 
@@ -865,6 +948,16 @@ export class Stream {
     }
     private onWsClose() {
         this.debugLog(`Web Socket Closed`)
+
+        // If the WebSocket closes before we have a peer connection, it means
+        // the connection failed entirely (e.g. Tesla browser dropping the WS).
+        // Dispatch an error so the UI can show it instead of hanging on "Connecting".
+        if (!this.peer || this.peer.connectionState !== "connected") {
+            const event: InfoEvent = new CustomEvent("stream-info", {
+                detail: { type: "error", message: "WebSocket closed before stream connected" }
+            })
+            this.eventTarget.dispatchEvent(event)
+        }
     }
 
     private sendWsMessage(message: StreamClientMessage) {
@@ -926,8 +1019,8 @@ export class Stream {
             droppedBufferedSources: this.audioDroppedBufferedSources,
             droppedLatencyFlushes: this.audioDroppedLatencyFlushes,
             droppedCleanupSources: this.audioDroppedCleanupSources,
-            queuedSources: this.sourceNodes.size,
-            bufferLeadMs: Math.max(0, (this.nextAudioTime - currentTime) * 1000),
+            queuedSources: 0,
+            bufferLeadMs: this.workletBufferMs,
             lastPacketGapMs: this.audioLastPacketGapMs,
             avgPacketGapMs: this.audioAvgPacketGapMs,
             maxPacketGapMs: this.audioMaxPacketGapMs,

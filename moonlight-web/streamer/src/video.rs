@@ -118,10 +118,10 @@ impl TrackSampleVideoDecoder {
         timestamp: u32,
         _frame_interval: Duration,
     ) {
-        // Send all RTP packets for this frame as fast as possible.
-        // No pacing: the playout-delay extension (0,0) already tells the browser
-        // to deliver frames immediately. Any delay here just blocks the callback
-        // thread and delays processing of subsequent frames from moonlight-common-c.
+        // Send all RTP packets for this frame as a burst.
+        // The playout-delay extension (min=20ms, max=100ms) gives the receiver's
+        // jitter buffer headroom to absorb arrival jitter from burst sending.
+        // Pacing would help on cellular but would block the callback thread.
         let mut peekable = samples.drain(..).peekable();
         while let Some(sample) = peekable.next() {
             let packets = match packetize(
@@ -179,25 +179,53 @@ impl VideoDecoder for TrackSampleVideoDecoder {
         self.clock_rate = codec.capability.clock_rate;
 
         let needs_idr = self.needs_idr.clone();
-        if let Err(err) = self.sender.blocking_create_track(
-            TrackLocalStaticRTP::new(
-                codec.capability.clone(),
-                "video".to_string(),
-                "moonlight".to_string(),
-            )
-            .into(),
-            move |packet| {
-                let packet = packet.as_any();
 
-                if packet.is::<PictureLossIndication>() {
-                    needs_idr.store(true, Ordering::Release);
-                }
-                if let Some(_max_bitrate) = packet.downcast_ref::<ReceiverEstimatedMaximumBitrate>()
-                {
-                    // Moonlight doesn't support dynamic bitrate changing :(
-                }
-            },
-        ) {
+        // Use replace_track on the pre-registered transceiver sender.
+        // This is codec-agnostic: all codecs were already in the initial SDP, and we
+        // now attach the correct track without triggering renegotiation.
+        let pre_sender = self.sender.stream.pre_video_sender.blocking_lock().take();
+
+        let video_track = Arc::new(TrackLocalStaticRTP::new(
+            codec.capability.clone(),
+            "video".to_string(),
+            "moonlight".to_string(),
+        ));
+
+        let track_ok = if let Some(rtp_sender) = pre_sender {
+            self.sender.blocking_activate_via_replace_track(
+                video_track,
+                rtp_sender,
+                move |packet| {
+                    let packet = packet.as_any();
+                    if packet.is::<PictureLossIndication>() {
+                        needs_idr.store(true, Ordering::Release);
+                    }
+                },
+            )
+        } else {
+            // No pre-registered sender (should not happen in normal flow).
+            self.sender.blocking_create_track(
+                TrackLocalStaticRTP::new(
+                    codec.capability.clone(),
+                    "video".to_string(),
+                    "moonlight".to_string(),
+                )
+                .into(),
+                move |packet| {
+                    let packet = packet.as_any();
+                    if packet.is::<PictureLossIndication>() {
+                        needs_idr.store(true, Ordering::Release);
+                    }
+                    if let Some(_max_bitrate) =
+                        packet.downcast_ref::<ReceiverEstimatedMaximumBitrate>()
+                    {
+                        // Moonlight doesn't support dynamic bitrate changing :(
+                    }
+                },
+            )
+        };
+
+        if let Err(err) = track_ok {
             error!(
                 "Failed to create video track with format {format:?} and codec \"{codec:?}\": {err:?}"
             );
@@ -358,7 +386,7 @@ fn packetize(
     Ok(packets)
 }
 
-fn video_format_to_codec(format: VideoFormat) -> Option<RTCRtpCodecParameters> {
+pub(crate) fn video_format_to_codec(format: VideoFormat) -> Option<RTCRtpCodecParameters> {
     let rtcp_feedback = vec![
         RTCPFeedback {
             typ: "nack".to_string(),

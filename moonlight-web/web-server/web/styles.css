@@ -588,10 +588,29 @@ input[type=number] {
 }
 
 canvas.video-stream {
-    width: 100%;
-    height: 100%;
+    /* Override the centering transform from .video-stream — transform forces the compositor
+       to apply a matrix on every vsync even when the canvas content hasn't changed.
+       For a full-viewport canvas, position: fixed + inset: 0 achieves the same layout
+       without any per-frame compositor cost. */
+    top: 0;
+    left: 0;
+    transform: none;
+    width: 100vw;
+    height: 100vh;
+    min-width: unset;
+    min-height: unset;
+    max-width: unset;
+    max-height: unset;
     object-fit: contain;
     will-change: contents;
+}
+
+video.video-stream.video-stream-stretched {
+    width: 100vw;
+    height: 100vh;
+    min-width: unset;
+    min-height: unset;
+    object-fit: fill;
 }
 
 /** Stream Stats Overlay */

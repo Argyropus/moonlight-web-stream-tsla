@@ -43,8 +43,10 @@ export async function showModal<Output>(modal: Modal<Output>): Promise<Output | 
     const output = await modal.onFinish(abortController.signal)
 
     modalBackground?.classList.add("modal-disabled")
-    modalAbort.abort()
-    modalAbort = null
+    abortController.abort()
+    if (modalAbort === abortController) {
+        modalAbort = null
+    }
 
     return output
 }

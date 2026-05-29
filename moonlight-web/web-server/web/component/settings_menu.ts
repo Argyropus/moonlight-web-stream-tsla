@@ -21,6 +21,7 @@ export type StreamSettings = {
     dontForceH264: boolean
     canvasRenderer: boolean
     playAudioLocal: boolean
+    keepAudioAlive: boolean
     audioSampleQueueSize: number
     mouseScrollMode: MouseScrollMode
     controllerConfig: ControllerConfig
@@ -47,6 +48,7 @@ export function defaultStreamSettings(): StreamSettings {
         dontForceH264: false,
         canvasRenderer: true,
         playAudioLocal: false,
+        keepAudioAlive: true,
         audioSampleQueueSize: 1,
         mouseScrollMode: "normal",
         controllerConfig: {
@@ -108,6 +110,7 @@ export class StreamSettingsComponent implements Component {
     private videoSampleQueueSize: InputComponent
 
     private playAudioLocal: InputComponent
+    private keepAudioAlive: InputComponent
     private audioSampleQueueSize: InputComponent
 
     private mouseScrollMode: SelectComponent
@@ -212,6 +215,12 @@ export class StreamSettingsComponent implements Component {
         })
         this.playAudioLocal.addChangeListener(this.onSettingsChange.bind(this))
         this.playAudioLocal.mount(audioSection)
+
+        this.keepAudioAlive = new InputComponent("keepAudioAlive", "checkbox", "Keep Audio Context Alive (Tesla Fix)", {
+            checked: settings?.keepAudioAlive ?? defaultSettings.keepAudioAlive
+        })
+        this.keepAudioAlive.addChangeListener(this.onSettingsChange.bind(this))
+        this.keepAudioAlive.mount(audioSection)
 
         // Audio Sample Queue Size
         this.audioSampleQueueSize = new InputComponent("audioSampleQueueSize", "number", "Audio Sample Queue Size", {
@@ -329,7 +338,7 @@ export class StreamSettingsComponent implements Component {
         this.useVideoWorker.mount(advancedSection)
 
         // Stretch to fit
-        this.stretchToFit = new InputComponent("stretchToFit", "checkbox", "Stretch image to fit window (Canvas Renderer Only)", {
+        this.stretchToFit = new InputComponent("stretchToFit", "checkbox", "Stretch image to fit window", {
             checked: settings?.stretchToFit ?? defaultSettings.stretchToFit
         })
         this.stretchToFit.addChangeListener(this.onSettingsChange.bind(this))
@@ -479,6 +488,7 @@ export class StreamSettingsComponent implements Component {
         settings.canvasRenderer = this.canvasRenderer.isChecked()
 
         settings.playAudioLocal = this.playAudioLocal.isChecked()
+        settings.keepAudioAlive = this.keepAudioAlive.isChecked()
         settings.audioSampleQueueSize = parseInt(this.audioSampleQueueSize.getValue())
 
         settings.mouseScrollMode = this.mouseScrollMode.getValue() as any
