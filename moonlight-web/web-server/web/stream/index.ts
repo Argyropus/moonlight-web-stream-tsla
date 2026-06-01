@@ -143,6 +143,8 @@ export class Stream {
     private audioDroppedBufferedSources: number = 0
     private audioDroppedLatencyFlushes: number = 0
     private audioDroppedCleanupSources: number = 0
+    private workletFramesWritten: number = 0
+    private workletDrops: number = 0
     private lastAudioPacketAt: number = 0
     private audioLastPacketGapMs: number = 0
     private audioAvgPacketGapMs: number = 0
@@ -410,6 +412,8 @@ export class Stream {
                     if (event.data?.type === 'stats') {
                         this.workletBufferMs = event.data.bufferMs;
                         this.audioUnderruns = event.data.underruns;
+                        this.workletFramesWritten = event.data.framesWritten ?? 0;
+                        this.workletDrops = event.data.drops ?? 0;
                     }
                 };
 
@@ -1007,15 +1011,20 @@ export class Stream {
 
     getAudioDiagnostics(): StreamAudioDiagnostics {
         const currentTime = this.audioContext?.currentTime ?? 0
+        // In worker mode, audioPacketsDecoded stays 0 since playPcm() is bypassed.
+        // Use workletFramesWritten as the actual decoded count.
+        const decodedPackets = this.useAudioDecodeWorker
+            ? this.workletFramesWritten
+            : this.audioPacketsDecoded
         return {
             decoderReady: this.audioDecoderReady,
             audioContextState: this.audioContext?.state ?? "missing",
             receivedPackets: this.audioPacketsReceived,
-            decodedPackets: this.audioPacketsDecoded,
+            decodedPackets,
             receivedBytes: this.audioBytesReceived,
             decodeErrors: this.audioDecodeErrors,
             underruns: this.audioUnderruns,
-            resyncs: this.audioResyncs,
+            resyncs: this.workletDrops,
             droppedBufferedSources: this.audioDroppedBufferedSources,
             droppedLatencyFlushes: this.audioDroppedLatencyFlushes,
             droppedCleanupSources: this.audioDroppedCleanupSources,

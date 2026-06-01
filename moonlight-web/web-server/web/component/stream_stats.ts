@@ -78,15 +78,14 @@ export class StreamStatsOverlay implements Component {
     constructor() {
         this.root.classList.add("stream-stats-overlay")
 
-        // Header with refresh button — stats are on-demand only to avoid
-        // peer.getStats() mutex locks that cause micro-stutter.
+        // Header with refresh button
         const header = document.createElement("div")
         header.classList.add("stream-stats-row")
         header.style.cursor = "pointer"
         header.style.userSelect = "none"
         header.style.opacity = "0.8"
         header.style.textAlign = "center"
-        header.textContent = "[ tap to refresh stats ]"
+        header.textContent = "[ stream stats — auto-refresh 2s ]"
         header.addEventListener("click", (e) => {
             e.stopPropagation()
             this.scheduleUpdate()
@@ -151,10 +150,11 @@ export class StreamStatsOverlay implements Component {
 
     show() {
         this.root.style.display = ""
-        // On-demand only: do one initial refresh when shown, then user taps to refresh.
-        // No periodic polling — peer.getStats() locks internal WebRTC mutexes
-        // which stall the RTP receive thread and cause micro-stutter.
         this.scheduleUpdate()
+        // Auto-refresh every 2 seconds while visible
+        if (!this.intervalId) {
+            this.intervalId = setInterval(() => this.scheduleUpdate(), 2000)
+        }
     }
 
     hide() {
@@ -331,10 +331,10 @@ export class StreamStatsOverlay implements Component {
         const audioDiag: StreamAudioDiagnostics | null = stream ? stream.getAudioDiagnostics() : null
         const workerDiag = this.workerDiagnosticsGetter?.() ?? null
         if (audioDiag) {
-            this.elAudioBuffer.textContent = `${audioDiag.bufferLeadMs.toFixed(1)} ms lead, ${audioDiag.queuedSources} queued, ctx=${audioDiag.audioContextState}`
+            this.elAudioBuffer.textContent = `${audioDiag.bufferLeadMs.toFixed(1)} ms lead, ctx=${audioDiag.audioContextState}`
             this.elAudioGap.textContent = `last ${audioDiag.lastPacketGapMs.toFixed(1)} ms, avg ${audioDiag.avgPacketGapMs.toFixed(1)} ms, max ${audioDiag.maxPacketGapMs.toFixed(1)} ms, late ${audioDiag.latePacketGaps}`
-            this.elAudioDropReason.textContent = `latency flush ${audioDiag.droppedLatencyFlushes}, cleanup ${audioDiag.droppedCleanupSources}, total ${audioDiag.droppedBufferedSources}`
-            this.elAudioPipeline.textContent = `rx ${audioDiag.receivedPackets}, dec ${audioDiag.decodedPackets}, err ${audioDiag.decodeErrors}, underrun ${audioDiag.underruns}, resync ${audioDiag.resyncs}`
+            this.elAudioDropReason.textContent = `worklet drops ${audioDiag.resyncs}, latency flush ${audioDiag.droppedLatencyFlushes}, cleanup ${audioDiag.droppedCleanupSources}`
+            this.elAudioPipeline.textContent = `rx ${audioDiag.receivedPackets}, dec ${audioDiag.decodedPackets}, err ${audioDiag.decodeErrors}, underrun ${audioDiag.underruns}`
         } else {
             this.elAudioGap.textContent = "—"
             this.elAudioDropReason.textContent = "—"
