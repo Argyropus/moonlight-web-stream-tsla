@@ -208,10 +208,26 @@ async fn main() {
         }
     }
     if let Some(mapping) = server_config.webrtc_nat_1to1 {
-        api_settings.set_nat_1to1_ips(
-            mapping.ips.clone(),
-            into_webrtc_ice_candidate(mapping.ice_candidate_type),
-        );
+        let valid_ips: Vec<String> = mapping.ips.iter()
+            .filter(|ip| {
+                let is_placeholder = ip.contains('<') || ip.contains('>');
+                if is_placeholder {
+                    warn!(
+                        "[Stream]: Skipping placeholder NAT IP '{}' — replace it with your real public IP in server/config.json. \
+                         WebRTC may not work over the Internet without a valid NAT IP.",
+                        ip
+                    );
+                }
+                !is_placeholder
+            })
+            .cloned()
+            .collect();
+        if !valid_ips.is_empty() {
+            api_settings.set_nat_1to1_ips(
+                valid_ips,
+                into_webrtc_ice_candidate(mapping.ice_candidate_type),
+            );
+        }
     }
     api_settings.set_network_types(
         server_config

@@ -21,9 +21,9 @@ pub struct Config {
     pub pair_device_name: String,
     #[serde(default = "default_ice_servers")]
     pub webrtc_ice_servers: Vec<RtcIceServer>,
-    #[serde(default)]
+    #[serde(default = "default_webrtc_port_range")]
     pub webrtc_port_range: Option<PortRange>,
-    #[serde(default)]
+    #[serde(default = "default_webrtc_nat_1to1")]
     pub webrtc_nat_1to1: Option<WebRtcNat1To1Mapping>,
     #[serde(default = "default_network_types")]
     pub webrtc_network_types: Vec<WebRtcNetworkType>,
@@ -81,8 +81,8 @@ impl Default for Config {
             bind_address: default_bind_address(),
             moonlight_default_http_port: moonlight_default_http_port_default(),
             webrtc_ice_servers: default_ice_servers(),
-            webrtc_port_range: Default::default(),
-            webrtc_nat_1to1: Default::default(),
+            webrtc_port_range: default_webrtc_port_range(),
+            webrtc_nat_1to1: default_webrtc_nat_1to1(),
             webrtc_network_types: default_network_types(),
             pair_device_name: default_pair_device_name(),
             web_path_prefix: String::new(),
@@ -97,7 +97,7 @@ fn data_path_default() -> String {
 }
 
 fn default_bind_address() -> SocketAddr {
-    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080))
+    SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 8080))
 }
 
 fn moonlight_default_http_port_default() -> u16 {
@@ -105,24 +105,22 @@ fn moonlight_default_http_port_default() -> u16 {
 }
 
 fn default_ice_servers() -> Vec<RtcIceServer> {
-    vec![
-        // Google
-        RtcIceServer {
-            urls: vec![
-                // Google
-                "stun:l.google.com:19302".to_owned(),
-                "stun:stun.l.google.com:19302".to_owned(),
-                "stun:stun1.l.google.com:19302".to_owned(),
-                "stun:stun2.l.google.com:19302".to_owned(),
-                "stun:stun3.l.google.com:19302".to_owned(),
-                "stun:stun4.l.google.com:19302".to_owned(),
-            ],
-            ..Default::default()
-        },
-    ]
+    vec![RtcIceServer {
+        urls: vec!["stun:stun.cloudflare.com:3478".to_owned()],
+        ..Default::default()
+    }]
 }
 fn default_network_types() -> Vec<WebRtcNetworkType> {
-    vec![WebRtcNetworkType::Udp4, WebRtcNetworkType::Udp6]
+    vec![WebRtcNetworkType::Udp4]
+}
+fn default_webrtc_nat_1to1() -> Option<WebRtcNat1To1Mapping> {
+    Some(WebRtcNat1To1Mapping {
+        ice_candidate_type: WebRtcNat1To1IceCandidateType::Srflx,
+        ips: vec!["<YOUR_PUBLIC_IP>".to_owned()],
+    })
+}
+fn default_webrtc_port_range() -> Option<PortRange> {
+    Some(PortRange { min: 40000, max: 40100 })
 }
 
 fn default_pair_device_name() -> String {

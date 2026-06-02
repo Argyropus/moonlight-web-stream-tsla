@@ -1,38 +1,31 @@
 {
-  "credentials": null,
-  "data_path": "server/data.json",
   "bind_address": "0.0.0.0:8080",
+  "certificate": null,
+  "credentials": "default",
+  "data_path": "server/data.json",
   "moonlight_default_http_port": 47989,
   "pair_device_name": "roth",
+  "streamer_path": "./streamer",
+  "totp_secret": null,
+  "web_path_prefix": "",
   "webrtc_ice_servers": [
     {
       "urls": [
-        "stun:l.google.com:19302",
-        "stun:stun.l.google.com:19302",
-        "stun:stun1.l.google.com:19302",
-        "stun:stun2.l.google.com:19302",
-        "stun:stun3.l.google.com:19302",
-        "stun:stun4.l.google.com:19302"
-      ],
-      "username": "",
-      "credential": ""
+        "stun:stun.cloudflare.com:3478"
+      ]
     }
+  ],
+  "webrtc_nat_1to1": {
+    "ice_candidate_type": "srflx",
+    "ips": [
+      "<YOUR_PUBLIC_IP>"
+    ]
+  },
+  "webrtc_network_types": [
+    "udp4"
   ],
   "webrtc_port_range": {
     "min": 40000,
     "max": 40100
-  },
-  "webrtc_nat_1to1": {
-    "ice_candidate_type": "host",
-    "ips": [
-      "127.0.0.1"
-    ]
-  },
-  "webrtc_network_types": [
-    "udp4",
-    "udp6"
-  ],
-  "web_path_prefix": "",
-  "certificate": null,
-  "streamer_path": "./streamer"
+  }
 }

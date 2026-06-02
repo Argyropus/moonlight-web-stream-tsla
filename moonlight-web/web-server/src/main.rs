@@ -11,7 +11,7 @@ use actix_web::{
     middleware::DefaultHeaders,
     web::Data,
 };
-use log::{LevelFilter, info};
+use log::{LevelFilter, info, warn};
 use serde::{Serialize, de::DeserializeOwned};
 use simplelog::{ColorChoice, TermLogger, TerminalMode};
 
@@ -66,6 +66,17 @@ async fn main2() -> Result<(), anyhow::Error> {
         info!("Enter your credentials in the config (server/config.json)");
 
         return Ok(());
+    }
+    if let Some(nat) = &config.webrtc_nat_1to1 {
+        for ip in &nat.ips {
+            if ip.contains('<') || ip.contains('>') {
+                warn!(
+                    "Placeholder NAT IP '{}' found in config — streaming over the Internet will likely fail. \
+                     Replace it with your real public IP (check https://whatismyip.com). See README for details.",
+                    ip
+                );
+            }
+        }
     }
     let creds = ApiCredentials::new(
         config.credentials.clone(),

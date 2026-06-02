@@ -15,6 +15,8 @@ https://youtu.be/whdvHChCQbg?si=WLcgPDclkdr8n41i
 - [Limitations](#limitations)
 - [Installation](#installation)
 - [Setup](#setup)
+  - [Streaming to a Tesla Browser](#streaming-to-a-tesla-browser)
+  - [Troubleshooting](#troubleshooting)
   - [Streaming over the Internet](#streaming-over-the-internet)
   - [Configuring https](#configuring-https)
   - [Proxying via Apache 2](#proxying-via-apache-2)
@@ -52,17 +54,93 @@ https://youtu.be/whdvHChCQbg?si=WLcgPDclkdr8n41i
 
 4. Change your [access credentials](#credentials) in the newly generated `server/config.json` (all changes require a restart)
 
-5. Go to `localhost:8080` and view the web interface. You can also the change [bind address](#bind-address).
+5. Go to `http://localhost:8080` and view the web interface. You can also change the [bind address](#bind-address).
 
 ## Setup
 
-Add your pc:
+Add your PC:
 
-1. Add a new pc (<img src="moonlight-web/web-server/web/resources/ic_add_to_queue_white_48px.svg" alt="icon" style="height:1em; vertical-align:middle;">) with the address as `localhost` and leave the port empty (if you've got the default port)
+1. Add a new PC (<img src="moonlight-web/web-server/web/resources/ic_add_to_queue_white_48px.svg" alt="icon" style="height:1em; vertical-align:middle;">) with the address `localhost` and leave the port empty (if you're using the default port)
 
-2. Pair your pc by clicking on the host (<img src="moonlight-web/web-server/web/resources/desktop_windows-48px.svg" alt="icon" style="height:1em; vertical-align:middle;">) and entering the code in sunshine
+2. Pair your PC by clicking on the host (<img src="moonlight-web/web-server/web/resources/desktop_windows-48px.svg" alt="icon" style="height:1em; vertical-align:middle;">) and entering the code in Sunshine
 
 3. Launch an app
+
+### Streaming to a Tesla Browser
+
+The Tesla browser enforces strict security policies. Accessing Moonlight Web via a local IP address (e.g. `192.168.1.x`) will typically result in an **Access Denied** error. You must access it via a proper domain name over the Internet (or your car's cellular connection).
+
+**Required ports to open (in your router/firewall):**
+
+| Port | Protocol | Purpose |
+|------|----------|---------|
+| 8080 | TCP | Web interface (or whichever port you configured) |
+| 40000–40100 | UDP | WebRTC media stream |
+
+> **Windows Firewall:** On some systems you may need to add inbound rules for UDP 40000–40100. Try temporarily disabling Windows Firewall to test if it's blocking traffic. If that helps, add the rules and re-enable it. Also make sure your network profile is set to **Private**.
+
+**Steps to get it working from the Tesla browser:**
+
+1. **Get a domain name pointing to your public IP.** Many routers offer free dynamic DNS (DDNS):
+   - ASUS routers: free `*.asuscomm.com` domain + built-in SSL certificate export
+   - TP-Link routers: similar DDNS feature in the router admin panel
+   - Alternatives: No-IP, DuckDNS, Cloudflare, etc.
+
+   Check your current public IP at [whatismyip.com](https://www.whatismyip.com/). Your DNS record must point to this IP.
+
+2. **Set your public IP in the config** (`server/config.json`):
+   ```json
+   {
+     "webrtc_nat_1to1": {
+       "ice_candidate_type": "srflx",
+       "ips": [
+         "12.34.56.78"
+       ]
+     }
+   }
+   ```
+   Replace `12.34.56.78` with your actual public IP (only digits and dots, no `<` or `>`).
+
+3. **Forward ports in your router:**
+   - TCP 8080 → your PC's local IP (e.g. `192.168.1.50`)
+   - UDP 40000–40100 → your PC's local IP
+
+4. **Use the Cloudflare / Google STUN server** and `udp4` only (already in the default config):
+   ```json
+   {
+     "webrtc_ice_servers": [
+       { "urls": ["stun:stun.cloudflare.com:3478"] }
+     ],
+     "webrtc_network_types": ["udp4"]
+   }
+   ```
+
+5. Access the web interface from your Tesla browser via `http://yourdomain.com:8080` — or with HTTPS on port 443 if you've [configured a certificate](#configuring-https).
+
+> **Note:** HTTPS with a valid certificate is required for controller support (Gamepad API). Some routers let you export a signed certificate directly. See [Configuring https](#configuring-https).
+
+### Troubleshooting
+
+**Stream connects on PC/phone (local Wi-Fi) but not over cellular or in the Tesla browser:**
+- The most common cause is a missing or wrong public IP in `webrtc_nat_1to1`. Double-check it matches [whatismyip.com](https://www.whatismyip.com/).
+- Make sure UDP 40000–40100 is forwarded in your router to your PC.
+- Try temporarily disabling Windows Firewall to isolate whether it is blocking UDP.
+
+**Tesla browser shows "Access Denied":**
+- You are likely trying to access via a local IP address. The Tesla browser blocks local addresses. Use a domain name with a proper DNS record pointing to your public IP.
+- Make sure your Tesla is on the same Wi-Fi or using cellular, and that the domain resolves to your router's public IP.
+
+**Audio is not playing after stream starts:**
+- This is a browser autoplay restriction. **Tap or click anywhere inside the stream** after it starts — this triggers the AudioContext to resume.
+- Make sure audio is actually playing on the host PC (not muted).
+- Turn up the volume in the Tesla.
+- If using [Apollo](https://github.com/ClassicOldSong/Apollo) instead of Sunshine, try switching to [Sunshine](https://github.com/LizardByte/Sunshine). Apollo has been observed to have performance issues with this client.
+- In Sunshine audio settings: leave **Audio sink** and **Virtual sink** empty (auto), and ensure both audio checkboxes are checked.
+- When streaming is active, check the Windows Volume Mixer — you should see "Steam Streaming Speakers" with an active level meter (audio is captured but not played locally).
+
+**The `.exe` won't start after editing config:**
+- The config is JSON — check for missing or extra commas, especially after the last item in a block.
+- Make sure `webrtc_nat_1to1.ips` contains plain IP addresses like `"12.34.56.78"` with no `<` or `>` brackets.
 
 ### Streaming over the Internet
 
