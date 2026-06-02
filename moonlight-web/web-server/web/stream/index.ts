@@ -11,6 +11,7 @@ type AudioDecodeWorkerInMessage =
     | { type: "decode"; packet: ArrayBuffer }
     | { type: "decodeBatch"; packets: ArrayBuffer[] }
     | { type: "free" }
+    | { type: "use-main-thread" }
 
 type AudioDecodeWorkerOutMessage =
     | { type: "ready" }
@@ -120,6 +121,7 @@ export class Stream {
     // real-time audio rendering thread, immune to main-thread congestion.
     private audioWorkletNode: AudioWorkletNode | null = null
     private audioWorkletReady: boolean = false
+    private audioFallbackReady: boolean = false
     private isFirstAudioPacket: boolean = true
     private workletBufferMs: number = 0
     // PCM buffer recycling: collect used ArrayBuffers and return to worker in batches
@@ -283,9 +285,13 @@ export class Stream {
                     this.decoderInitInFlight = false
                     this.audioDecodeWorkerInitError = null
                     this.debugLog("Audio decode worker ready")
-                    // If worklet is already ready, wire direct channel now
+                    // If worklet is already ready, wire direct channel now.
+                    // If we are in fallback mode (no worklet), tell the worker to
+                    // send decoded frames back to the main thread instead.
                     if (this.audioWorkletReady) {
                         this.wireDirectAudioChannel();
+                    } else if (this.audioFallbackReady) {
+                        this.audioDecodeWorker?.postMessage({ type: "use-main-thread" } as AudioDecodeWorkerInMessage);
                     }
                     return
                 }
@@ -395,7 +401,17 @@ export class Stream {
             // Register AudioWorklet for real-time-thread audio rendering.
             // This is the key to stutter-free playback: process() runs on the
             // audio rendering thread, not the main thread.
-            this.audioContext.audioWorklet.addModule(
+            // AudioWorklet is only available in secure contexts (HTTPS/localhost).
+            // Fall back to scheduled AudioBufferSourceNode playback over plain HTTP.
+            if (!this.audioContext.audioWorklet) {
+                this.audioFallbackReady = true;
+                this.debugLog("AudioWorklet unavailable (non-secure context), using scheduled buffer fallback");
+                // Tell the decode worker (if already ready) to send decoded frames
+                // back to the main thread rather than buffering for a worklet port.
+                if (this.audioDecodeWorker) {
+                    this.audioDecodeWorker.postMessage({ type: "use-main-thread" } as AudioDecodeWorkerInMessage);
+                }
+            } else { this.audioContext.audioWorklet.addModule(
                 new URL("./audio_playback_worklet.js", import.meta.url).href
             ).then(() => {
                 if (!this.audioContext) return;
@@ -425,7 +441,7 @@ export class Stream {
             }).catch((e) => {
                 console.error("AudioWorklet registration failed:", e);
                 this.debugLog(`AudioWorklet failed: ${e}`);
-            });
+            }); }
 
             if (this.settings.keepAudioAlive) {
                 const keepaliveOsc = this.audioContext.createOscillator();
@@ -468,7 +484,8 @@ export class Stream {
     }
 
     private playPcm(left: Float32Array, right: Float32Array) {
-        if (!this.audioContext || !this.audioWorkletReady || !this.audioWorkletNode) return;
+        if (!this.audioContext) return;
+        if (!this.audioWorkletReady && !this.audioFallbackReady) return;
 
         if (this.audioContext.state === 'suspended') {
             this.audioContext.resume();
@@ -476,14 +493,35 @@ export class Stream {
 
         this.audioPacketsDecoded++;
 
-        // Post PCM data to the AudioWorklet processor's port.
-        // The worklet's process() runs on the real-time audio thread — 
-        // immune to main-thread GC, DataChannel bursts, rAF, etc.
-        // Transfer the underlying ArrayBuffers for zero-copy.
-        this.audioWorkletNode.port.postMessage(
-            { type: 'pcm', left: left.buffer, right: right.buffer },
-            [left.buffer, right.buffer]
-        );
+        if (this.audioWorkletReady && this.audioWorkletNode) {
+            // Worklet path (secure context): runs on the real-time audio thread —
+            // immune to main-thread GC, DataChannel bursts, rAF, etc.
+            // Transfer the underlying ArrayBuffers for zero-copy.
+            this.audioWorkletNode.port.postMessage(
+                { type: 'pcm', left: left.buffer, right: right.buffer },
+                [left.buffer, right.buffer]
+            );
+        } else if (this.audioFallbackReady) {
+            this.playPcmFallback(left, right);
+        }
+    }
+
+    private playPcmFallback(left: Float32Array, right: Float32Array) {
+        if (!this.audioContext || !this.mainGainNode) return;
+        const numFrames = left.length;
+        const buffer = this.audioContext.createBuffer(2, numFrames, 48000);
+        buffer.copyToChannel(left, 0);
+        buffer.copyToChannel(right, 1);
+        const source = this.audioContext.createBufferSource();
+        source.buffer = buffer;
+        source.connect(this.mainGainNode);
+        const now = this.audioContext.currentTime;
+        if (this.nextAudioTime < now || this.audioContextInterrupted) {
+            this.nextAudioTime = now + 0.05; // 50 ms ahead to absorb jitter
+            this.audioContextInterrupted = false;
+        }
+        source.start(this.nextAudioTime);
+        this.nextAudioTime += numFrames / 48000;
     }
 
     private wireDirectAudioChannel() {

@@ -24,9 +24,12 @@ let pcmDirectPort: MessagePort | null = null
 // Buffer decoded frames until the direct port is available.
 // During startup, the worker may be ready before the worklet. Rather than
 // sending to main thread (which would drop frames if worklet isn't ready),
-// we buffer here and flush when the direct port arrives.
+// we buffer here and flush when the direct port arrives or main-thread mode is set.
 let pendingFrames: { left: ArrayBuffer; right: ArrayBuffer }[] = []
 const PENDING_MAX = 50 // ~500ms at 10ms/frame — limited, worklet will cap anyway
+
+// When true, send decoded frames to the main thread (no AudioWorklet available).
+let useMainThread = false
 
 // PCM buffer recycling pool: main thread returns used ArrayBuffers after
 // copyToChannel so we can reuse them instead of allocating new ones per decode.
@@ -77,9 +80,12 @@ async function initDecoder() {
                             { type: 'pcm', left: leftBuf, right: rightBuf },
                             [leftBuf, rightBuf]
                         )
+                    } else if (useMainThread) {
+                        // Fallback path (HTTP): send decoded PCM to the main thread
+                        const msg: DecodedMessage = { type: 'decoded', left: leftBuf, right: rightBuf }
+                        workerSelf.postMessage(msg, [leftBuf, rightBuf])
                     } else {
-                        // Startup path: buffer until direct port arrives.
-                        // Don't send to main thread — playPcm would drop if worklet isn't ready.
+                        // Startup path: buffer until direct port or main-thread mode is set.
                         if (pendingFrames.length < PENDING_MAX) {
                             pendingFrames.push({ left: leftBuf, right: rightBuf })
                         }
@@ -185,6 +191,19 @@ workerSelf.onmessage = (event: MessageEvent<WorkerInMessage | ArrayBuffer>) => {
                 { type: 'pcm', left: frame.left, right: frame.right },
                 [frame.left, frame.right]
             )
+        }
+        pendingFrames = []
+        return
+    }
+
+    if ((data as any).type === "use-main-thread") {
+        // No AudioWorklet available (non-secure context / HTTP).
+        // Switch to sending decoded frames back to the main thread.
+        useMainThread = true
+        // Flush any buffered frames to the main thread now.
+        for (const frame of pendingFrames) {
+            const msg: DecodedMessage = { type: 'decoded', left: frame.left, right: frame.right }
+            workerSelf.postMessage(msg, [frame.left, frame.right])
         }
         pendingFrames = []
         return
