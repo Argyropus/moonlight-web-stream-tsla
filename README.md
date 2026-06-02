@@ -117,7 +117,7 @@ The Tesla browser enforces strict security policies. Accessing Moonlight Web via
 
 5. Access the web interface from your Tesla browser via `http://yourdomain.com:8080` — or with HTTPS on port 443 if you've [configured a certificate](#configuring-https).
 
-> **Note:** HTTPS with a valid certificate is required for controller support (Gamepad API). Some routers let you export a signed certificate directly. See [Configuring https](#configuring-https).
+> **Note:** Some routers let you export a signed certificate directly. See [Configuring https](#configuring-https).
 
 ### Troubleshooting
 
