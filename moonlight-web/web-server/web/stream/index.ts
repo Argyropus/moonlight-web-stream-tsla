@@ -473,8 +473,36 @@ export class Stream {
                      // nextAudioTime while currentTime is frozen, causing a 300ms+
                      // latency burst and a flood of HARD_OVERRUN drops on resume.
                      this.audioContextInterrupted = true;
+                     // Aggressively try to resume — browsers (especially Tesla/Chromium)
+                     // can move to 'interrupted' state when the tab loses audio focus.
+                     // A single resume() call may not be enough; retry periodically.
+                     this.startAudioResumeRetry();
                  }
              };
+        }
+    }
+
+    private audioResumeRetryId: ReturnType<typeof setInterval> | null = null;
+
+    private startAudioResumeRetry() {
+        if (this.audioResumeRetryId) return; // already retrying
+        this.audioResumeRetryId = setInterval(() => {
+            if (!this.audioContext || this.audioContext.state === 'closed') {
+                this.stopAudioResumeRetry();
+                return;
+            }
+            if (this.audioContext.state === 'running') {
+                this.stopAudioResumeRetry();
+                return;
+            }
+            this.audioContext.resume().catch(() => {});
+        }, 1000);
+    }
+
+    private stopAudioResumeRetry() {
+        if (this.audioResumeRetryId) {
+            clearInterval(this.audioResumeRetryId);
+            this.audioResumeRetryId = null;
         }
     }
 
@@ -487,7 +515,7 @@ export class Stream {
         if (!this.audioContext) return;
         if (!this.audioWorkletReady && !this.audioFallbackReady) return;
 
-        if (this.audioContext.state === 'suspended') {
+        if (this.audioContext.state !== 'running') {
             this.audioContext.resume();
         }
 
@@ -910,8 +938,8 @@ export class Stream {
         if (!this.audioDecoderReady) return;
         this.audioPacketsReceived++;
 
-        // Ensure AudioContext is running (autoplay policy requires user gesture first)
-        if (this.audioContext && this.audioContext.state === 'suspended') {
+        // Ensure AudioContext is running (autoplay policy / browser interruption)
+        if (this.audioContext && this.audioContext.state !== 'running') {
             this.audioContext.resume();
         }
 
@@ -1105,7 +1133,7 @@ export class Stream {
             this.setupAudioContext()
         }
 
-        if (this.audioContext && this.audioContext.state === "suspended") {
+        if (this.audioContext && this.audioContext.state !== "running") {
             this.audioContext.resume();
         }
     }

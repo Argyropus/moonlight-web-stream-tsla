@@ -16,9 +16,12 @@ https://youtu.be/whdvHChCQbg?si=WLcgPDclkdr8n41i
 - [Installation](#installation)
 - [Setup](#setup)
   - [Streaming to a Tesla Browser](#streaming-to-a-tesla-browser)
+    - [Getting a free domain name](#getting-a-free-domain-name)
   - [Troubleshooting](#troubleshooting)
   - [Streaming over the Internet](#streaming-over-the-internet)
   - [Configuring https](#configuring-https)
+    - [Let's Encrypt (recommended)](#option-a-lets-encrypt-recommended-for-tesla--public-access)
+    - [Self-signed certificate](#option-b-self-signed-certificate)
   - [Proxying via Apache 2](#proxying-via-apache-2)
 - [Config](#config)
   - [Credentials](#credentials)
@@ -68,7 +71,28 @@ Add your PC:
 
 ### Streaming to a Tesla Browser
 
-The Tesla browser enforces strict security policies. Accessing Moonlight Web via a local IP address (e.g. `192.168.1.x`) will typically result in an **Access Denied** error. You must access it via a proper domain name over the Internet (or your car's cellular connection).
+The Tesla browser enforces strict security policies. Accessing Moonlight Web via a local IP address (e.g. `192.168.1.x`) will typically result in an **Access Denied** error. **You must access it via a proper domain name** — the Tesla browser blocks all requests to raw IP addresses and local network ranges.
+
+**Requirements for Tesla:**
+1. A **domain name** pointing to your public IP (see [Getting a free domain name](#getting-a-free-domain-name) below)
+2. Port forwarding configured on your router
+3. (Recommended) An HTTPS certificate for the domain — see [Configuring https](#configuring-https)
+
+#### Getting a free domain name
+
+You need a domain name that resolves to your home public IP. Here are free options:
+
+| Service | Domain Format | Notes |
+|---------|---------------|-------|
+| **ASUS Router DDNS** | `yourname.asuscomm.com` | Built into ASUS routers, auto-updates IP |
+| [DuckDNS](https://www.duckdns.org/) | `yourname.duckdns.org` | Free, simple, supports auto-update scripts |
+| [No-IP](https://www.noip.com/) | `yourname.ddns.net` | Free tier (confirm monthly) |
+| [Cloudflare](https://www.cloudflare.com/) | Your own domain | Free DNS management, buy domain elsewhere (~$10/yr) |
+| [Afraid.org FreeDNS](https://freedns.afraid.org/) | Various subdomains | Free, many domain options |
+
+> **Tip:** Most routers have a built-in DDNS client. Check your router admin panel under WAN → DDNS. This keeps the DNS record updated automatically when your public IP changes.
+
+Check your current public IP at [whatismyip.com](https://www.whatismyip.com/). Your DNS record must point to this IP.
 
 **Required ports to open (in your router/firewall):**
 
@@ -81,12 +105,7 @@ The Tesla browser enforces strict security policies. Accessing Moonlight Web via
 
 **Steps to get it working from the Tesla browser:**
 
-1. **Get a domain name pointing to your public IP.** Many routers offer free dynamic DNS (DDNS):
-   - ASUS routers: free `*.asuscomm.com` domain + built-in SSL certificate export
-   - TP-Link routers: similar DDNS feature in the router admin panel
-   - Alternatives: No-IP, DuckDNS, Cloudflare, etc.
-
-   Check your current public IP at [whatismyip.com](https://www.whatismyip.com/). Your DNS record must point to this IP.
+1. **Set up your domain** — follow [Getting a free domain name](#getting-a-free-domain-name) above if you don't already have one.
 
 2. **Set your public IP in the config** (`server/config.json`):
    ```json
@@ -222,18 +241,33 @@ It might be helpful to look what kind of nat your pc is behind:
 ### Configuring https
 You can configure https directly with the Moonlight Web Server.
 
-1. You'll need a private key and a certificate.
+#### Option A: Let's Encrypt (recommended for Tesla / public access)
 
-You can generate a self signed certificate with this python script [moonlight-web/web-server/generate_certificate.py](moonlight-web/web-server/generate_certificate.py):
+The included `acme-certificate` script automates obtaining a free, trusted SSL certificate from [Let's Encrypt](https://letsencrypt.org/). No third-party tools required.
 
-```sh
-pip install pyOpenSSL
-python ./moonlight-web/web-server/generate_certificate.py
+**Prerequisites:**
+- A domain name pointing to your public IP (e.g. DDNS like `*.asuscomm.com` — see [Getting a free domain](#getting-a-free-domain-name))
+- Port 80 forwarded on your router to the server's local IP and port (e.g. `192.168.1.50:8080`)
+
+**Windows:**
+```powershell
+.\acme-certificate.ps1
 ```
 
-2. Copy the files `server/key.pem` and `server/cert.pem` into your `server` directory.
+**Linux:**
+```bash
+chmod +x ./acme-certificate.sh
+./acme-certificate.sh
+```
 
-3. Modify the [config](#config) to enable https using the certificates
+The script will prompt for your domain and server URL, then automatically:
+1. Generate an account key (reused on subsequent runs)
+2. Request a certificate from Let's Encrypt
+3. Set up the HTTP-01 challenge via the server's API
+4. Wait for validation
+5. Save `server/cert.pem` and `server/key.pem`
+
+After the script completes, add this to your `server/config.json` and restart:
 ```json
 {
     "certificate": {
@@ -242,6 +276,58 @@ python ./moonlight-web/web-server/generate_certificate.py
     }
 }
 ```
+
+> **Tip:** Use `--staging` (or `-Staging` on Windows) to test with Let's Encrypt's staging environment first to avoid rate limits.
+
+##### Auto-renewal with Windows Task Scheduler
+
+Let's Encrypt certificates expire after 90 days. Set up a scheduled task to renew automatically:
+
+1. Open **Task Scheduler** → **Create Task**
+2. **General** tab: Name it `Moonlight Web Certificate Renewal`, check "Run whether user is logged on or not"
+3. **Triggers** tab: New → **On a schedule**, set to repeat every **60 days** (or weekly for safety)
+4. **Actions** tab: New →
+   - Program: `powershell.exe`
+   - Arguments: `-ExecutionPolicy Bypass -File "C:\path\to\acme-certificate.ps1" -Domain "yourdomain.com" -ServerUrl "http://192.168.1.100:8080"`
+   - Start in: `C:\path\to\moonlight-web\` (directory containing the server)
+5. Click OK and enter your Windows password
+
+The script will overwrite `server/cert.pem` and `server/key.pem`. Restart the server after renewal (or add `Restart-Service` / process restart to the script).
+
+##### Auto-renewal on Linux (cron)
+
+```bash
+# Edit crontab
+crontab -e
+
+# Add (runs on the 1st of every other month at 3am):
+0 3 1 */2 * cd /path/to/moonlight-web && ./acme-certificate.sh --domain "yourdomain.com" --server "http://localhost:8080" && systemctl restart moonlight-web
+```
+
+#### Option B: Self-signed certificate
+
+For local/development use where browser trust warnings are acceptable:
+
+1. Generate a self-signed certificate with the included Python script:
+
+```sh
+pip install pyOpenSSL
+python ./moonlight-web/web-server/generate_certificate.py
+```
+
+2. Copy the files `server/key.pem` and `server/cert.pem` into your `server` directory.
+
+3. Modify the [config](#config) to enable https:
+```json
+{
+    "certificate": {
+        "private_key_pem": "./server/key.pem",
+        "certificate_pem": "./server/cert.pem"
+    }
+}
+```
+
+> **Note:** Self-signed certificates will show browser warnings and may not work in the Tesla browser.
 
 ### Proxying via Apache 2
 It's possible to proxy the Moonlight Website using [Apache 2](https://httpd.apache.org/).

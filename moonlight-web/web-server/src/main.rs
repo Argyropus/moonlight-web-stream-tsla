@@ -16,11 +16,13 @@ use serde::{Serialize, de::DeserializeOwned};
 use simplelog::{ColorChoice, TermLogger, TerminalMode};
 
 use crate::{
+    acme::{acme_challenge_service, acme_api_service, new_challenge_store},
     api::{api_service, auth::ApiCredentials},
     data::{ApiData, RuntimeApiData},
     web::{web_config_js_service, web_service},
 };
 
+mod acme;
 mod api;
 mod data;
 mod web;
@@ -93,8 +95,10 @@ async fn main2() -> Result<(), anyhow::Error> {
     let data = RuntimeApiData::load(&config, data).await;
 
     let bind_address = config.bind_address;
+    let acme_store = Data::new(new_challenge_store());
     let server = HttpServer::new({
         let config = config.clone();
+        let acme_store = acme_store.clone();
 
         move || {
             App::new()
@@ -106,6 +110,9 @@ async fn main2() -> Result<(), anyhow::Error> {
                 )
                 .app_data(config.clone())
                 .app_data(credentials.clone())
+                .app_data(acme_store.clone())
+                .service(acme_challenge_service())
+                .service(acme_api_service())
                 .service(api_service(data.clone()))
                 .service(web_config_js_service())
                 .service(web_service())

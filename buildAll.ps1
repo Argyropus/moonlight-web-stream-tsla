@@ -1,4 +1,5 @@
 # Resolving paths
+$ErrorActionPreference = "Continue"
 
 $metadataJson = cargo metadata --format-version 1 --no-deps
 $metadata = $metadataJson | ConvertFrom-Json
@@ -116,8 +117,15 @@ Set-Location $moonlightFrontend
 
 New-Item -ItemType Directory "$outputDir/static" -Force | Out-Null
 
-Remove-Item -Path "$moonlightFrontend/dist" -Recurse -Force
+if (Test-Path "$moonlightFrontend/dist") {
+    Remove-Item -Path "$moonlightFrontend/dist" -Recurse -Force
+}
+$env:CARGO_TERM_COLOR = "never"
 npm run build
+if ($LASTEXITCODE -ne 0) {
+    Write-Error "Frontend build failed!"
+    exit $LASTEXITCODE
+}
 
 $frontendDist = Join-Path -Path $moonlightFrontend -ChildPath "dist"
 $assetHash = Get-BuildAssetHash -distDir $frontendDist
@@ -144,6 +152,11 @@ foreach($target in $targets) {
 
     Write-Output "------------- Starting Zipping for $target -------------"
     $itemsToZip = @($binaryPaths) + "$outputDir/static"
+    if ($target -clike "*windows*") {
+        $itemsToZip += "$moonlightRoot/acme-certificate.ps1"
+    } else {
+        $itemsToZip += "$moonlightRoot/acme-certificate.sh"
+    }
     $archiveName = "$outputDir/moonlight-web-$target"
 
     if ($target -clike "*windows*") {
