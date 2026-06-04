@@ -5,6 +5,8 @@
 
 This is a Tesla-optimized fork of [moonlight-web-stream](https://github.com/MrCreativ3001/moonlight-web-stream) — a browser-based Moonlight client. It includes **dozens of Tesla-specific fixes** for audio, video, input/gamepad handling, and WebSocket/WebRTC reliability that are required because the Tesla Chromium browser behaves differently from standard desktop browsers.
 
+It hosts a lightweight Web Server which forwards [Sunshine](https://docs.lizardbyte.dev/projects/sunshine/latest/) traffic to the browser using the [WebRTC API](https://webrtc.org/). No additional hardware or apps required — just your PC running Sunshine, port forwarding, and a domain name.
+
 ![An image displaying: PC with sunshine and moonlight web installed, a browser making requests to it](/readme/structure.png)
 
 ## Live demo in Tesla
@@ -32,6 +34,7 @@ https://youtu.be/whdvHChCQbg?si=WLcgPDclkdr8n41i
   - [Bind Address](#bind-address)
 - [Contributors](#contributors)
 - [Building](#building)
+- [Why this fork exists](#why-this-fork-exists)
 
 ## Images
 
@@ -587,5 +590,3 @@ The Tesla in-car browser has unique constraints that prevent vanilla Moonlight W
 
 ### Keywords / Use Cases
 > Tesla game streaming, Moonlight Tesla, stream PC to Tesla, Sunshine Tesla, remote desktop Tesla, cloud gaming Tesla, Tesla screen PC games, Tesla entertainment while charging, Tesla entertainment while driving, WebRTC Tesla, Moonlight web client, watch YouTube on Tesla, watch Netflix on Tesla, Tesla browser streaming, Tesla video streaming, stream to Tesla touchscreen
-
-It hosts a lightweight Web Server which forwards [Sunshine](https://docs.lizardbyte.dev/projects/sunshine/latest/) traffic to the browser using the [WebRTC API](https://webrtc.org/). No additional hardware or apps required — just your PC running Sunshine, port forwarding, and a domain name.
