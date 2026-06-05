@@ -141,6 +141,55 @@ export class StreamSettingsComponent implements Component {
             return section
         }
 
+        // --- Presets ---
+        const presetsSection = createSection("Presets")
+
+        const presetDesc = document.createElement("p")
+        presetDesc.style.cssText = "margin:0 0 8px;opacity:0.7;font-size:0.85em;"
+        presetDesc.innerText = "Apply optimized defaults. Overrides video, FPS, and bitrate settings."
+        presetsSection.appendChild(presetDesc)
+
+        const presetRow = document.createElement("div")
+        presetRow.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;"
+
+        const presets: Array<{ label: string, desc: string, values: Partial<StreamSettings> }> = [
+            {
+                label: "🎬 Video / Streaming",
+                desc: "1080p 30fps 3 Mbps — low bandwidth, smooth video playback",
+                values: { videoSize: "1080p", fps: 30, bitrate: 3000 }
+            },
+            {
+                label: "🎮 Gaming (Balanced)",
+                desc: "1080p 60fps 8 Mbps — good balance of quality and responsiveness",
+                values: { videoSize: "1080p", fps: 60, bitrate: 8000 }
+            },
+            {
+                label: "🎮 Gaming (Performance)",
+                desc: "1080p 120fps 12 Mbps — maximum responsiveness",
+                values: { videoSize: "1080p", fps: 120, bitrate: 12000 }
+            },
+            {
+                label: "📱 Low Bandwidth",
+                desc: "720p 30fps 1.5 Mbps — minimal data usage",
+                values: { videoSize: "720p", fps: 30, bitrate: 1500 }
+            },
+        ]
+
+        for (const preset of presets) {
+            const btn = document.createElement("button")
+            btn.innerText = preset.label
+            btn.title = preset.desc
+            btn.style.cssText = "flex:1;min-width:140px;padding:6px 10px;font-size:0.85em;"
+            btn.addEventListener("click", () => {
+                const current = getLocalStreamSettings() ?? defaultStreamSettings()
+                Object.assign(current, preset.values)
+                setLocalStreamSettings(current)
+                location.reload()
+            })
+            presetRow.appendChild(btn)
+        }
+        presetsSection.appendChild(presetRow)
+
         // --- Basic Settings ---
         const basicSection = createSection("Basic Settings")
 
