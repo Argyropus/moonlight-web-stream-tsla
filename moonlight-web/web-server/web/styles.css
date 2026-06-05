@@ -457,6 +457,19 @@ input[type=number] {
     height: 70px;
 }
 
+.fullscreen-launch {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 70px;
+    height: 70px;
+    background: transparent;
+    border: none;
+    cursor: pointer;
+    opacity: 0.85;
+}
+.fullscreen-launch:hover { opacity: 1; }
+
 .settings {
     color: white;
 }
