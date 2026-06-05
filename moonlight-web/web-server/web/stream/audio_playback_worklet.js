@@ -24,12 +24,12 @@ class PcmPlaybackProcessor extends AudioWorkletProcessor {
         this.lastStatsAt = 0;
         this.drops = 0;
         // Latency control thresholds (in samples at 48kHz):
-        // Target: 80ms = 3840 samples (initial buffer)
-        // Soft overrun: 150ms = 7200 samples → speed up playback
-        // Hard overrun: 300ms = 14400 samples → skip ahead
-        this.targetSamples = 3840;
-        this.softOverrunSamples = 7200;
-        this.hardOverrunSamples = 14400;
+        // Target: 120ms = 5760 samples (initial buffer — absorbs network jitter)
+        // Soft overrun: 200ms = 9600 samples → speed up playback
+        // Hard overrun: 350ms = 16800 samples → skip ahead
+        this.targetSamples = 5760;
+        this.softOverrunSamples = 9600;
+        this.hardOverrunSamples = 16800;
         // Direct PCM port from decode worker (bypasses main thread entirely)
         this.pcmPort = null;
 
