@@ -1070,7 +1070,7 @@ export class Stream {
     private beforeUnloadHandler: (() => void) | null = null
     private wsAttempt: number = 0
     private readonly WS_MAX_ATTEMPTS = 10
-    private readonly WS_CONNECT_TIMEOUT_MS = 8000
+    private readonly WS_CONNECT_TIMEOUT_MS = 5000
     private readonly WS_RETRY_DELAY_MS = 0
     private pendingAuthMessage: any = null
     // Serializes WebSocket message processing so messages are handled one-at-a-time
