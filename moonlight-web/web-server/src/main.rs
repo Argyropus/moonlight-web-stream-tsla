@@ -1,6 +1,12 @@
+// Windows GUI subsystem: prevents Windows Terminal from owning our console window.
+// We allocate our own console in main() so we have full control to hide/show it.
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
 use common::config::Config;
 use openssl::ssl::{SslAcceptor, SslFiletype, SslMethod};
 use std::{io::ErrorKind, path::Path};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use tokio::{
     fs,
     io::{AsyncBufReadExt, BufReader, stdin},
@@ -25,10 +31,22 @@ use crate::{
 mod acme;
 mod api;
 mod data;
+#[cfg(windows)]
+mod tray;
 mod web;
 
 #[actix_web::main]
 async fn main() {
+    // Allocate our own console window so we have full control (hide/show from tray).
+    // Because we use windows_subsystem = "windows", no console exists by default.
+    #[cfg(windows)]
+    unsafe {
+        use windows::Win32::System::Console::{AllocConsole, SetConsoleTitleW};
+        use windows::core::w;
+        let _ = AllocConsole();
+        let _ = SetConsoleTitleW(w!("Moonlight Web Tesla"));
+    }
+
     #[cfg(debug_assertions)]
     let log_level = LevelFilter::Debug;
     #[cfg(not(debug_assertions))]
@@ -42,11 +60,23 @@ async fn main() {
     )
     .expect("failed to init logger");
 
+    // Launch system tray (Windows only)
+    #[cfg(windows)]
+    let exit_signal = {
+        let signal = Arc::new(AtomicBool::new(false));
+        tray::spawn_tray(signal.clone());
+        signal
+    };
+    #[cfg(not(windows))]
+    let exit_signal = Arc::new(AtomicBool::new(false));
+
     if let Err(err) = main2().await {
         info!("Error: {err:?}");
     }
 
-    exit().await.expect("exit failed")
+    if !exit_signal.load(Ordering::Relaxed) {
+        exit().await.expect("exit failed")
+    }
 }
 
 async fn exit() -> Result<(), anyhow::Error> {
@@ -123,6 +153,11 @@ async fn main2() -> Result<(), anyhow::Error> {
     if let Some(certificate) = config.certificate.as_ref() {
         let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())
             .expect("failed to create ssl tls acceptor");
+        // Restrict ALPN to HTTP/1.1 only — actix-ws WebSocket upgrades require HTTP/1.1
+        // and will break if the browser negotiates HTTP/2 (which mozilla_intermediate advertises).
+        builder
+            .set_alpn_protos(b"\x08http/1.1")
+            .expect("failed to set ALPN protos");
         builder
             .set_private_key_file(&certificate.private_key_pem, SslFiletype::PEM)
             .expect("failed to set private key");

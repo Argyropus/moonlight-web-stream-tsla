@@ -463,10 +463,10 @@ if ($currentCreds -and $currentCreds -ne "default") {
 
 Write-Step "Step 3: Network configuration"
 
-# Detect LAN IPs
-$lanIps = Get-NetIPAddress -AddressFamily IPv4 |
+# Detect LAN IPs (force array even for single result to prevent string-indexing bugs)
+[string[]]$lanIps = @(Get-NetIPAddress -AddressFamily IPv4 |
     Where-Object { $_.IPAddress -notlike "127.*" -and $_.IPAddress -notlike "169.254.*" } |
-    Select-Object -ExpandProperty IPAddress
+    Select-Object -ExpandProperty IPAddress)
 
 if ($lanIps.Count -eq 1) {
     $lanIp = $lanIps[0]
@@ -477,7 +477,9 @@ if ($lanIps.Count -eq 1) {
         Write-Host "    $($i+1). $($lanIps[$i])"
     }
     $choice = Get-Input "Choose interface (1-$($lanIps.Count))" "1"
-    $lanIp = $lanIps[[int]$choice - 1]
+    $idx = [int]$choice - 1
+    if ($idx -lt 0 -or $idx -ge $lanIps.Count) { $idx = 0 }
+    $lanIp = $lanIps[$idx]
 } else {
     $lanIp = Get-Input "Could not detect LAN IP. Enter it manually" "192.168.1.100"
 }

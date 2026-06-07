@@ -628,6 +628,9 @@ impl StreamConnection {
             StreamClientMessage::Signaling(StreamSignalingMessage::Description(description)) => {
                 debug!("[Signaling] Received Remote Description: {:?}", description);
 
+                // Keep the raw SDP before converting (we'll need it to extract candidates)
+                let raw_sdp = description.sdp.clone();
+
                 let description = match &description.ty {
                     RtcSdpType::Offer => RTCSessionDescription::offer(description.sdp),
                     RtcSdpType::Answer => RTCSessionDescription::answer(description.sdp),
@@ -651,6 +654,11 @@ impl StreamConnection {
                     warn!("[Signaling]: failed to set remote description: {err:?}");
                     return;
                 }
+
+                // Workaround for webrtc-rs mDNS resolution stalling candidate pair formation:
+                // Explicitly add non-mDNS candidates from the SDP so that srflx/host IP
+                // candidates always form pairs, even if mDNS resolution is blocked/slow.
+                self.inject_non_mdns_candidates(&raw_sdp).await;
 
                 // Send an answer (local description) if we got an offer
                 if remote_ty == RTCSdpType::Offer {
@@ -715,6 +723,65 @@ impl StreamConnection {
     // -- Data Channels
     async fn on_data_channel(self: &Arc<Self>, channel: Arc<RTCDataChannel>) {
         self.input.on_data_channel(self, channel).await;
+    }
+
+    /// Parse non-mDNS `a=candidate:` lines from an SDP and explicitly add them
+    /// via `add_ice_candidate()`. This works around a webrtc-rs issue where mDNS
+    /// resolution can stall the entire candidate-pair formation pipeline, preventing
+    /// srflx and real-IP host candidates from ever being paired.
+    async fn inject_non_mdns_candidates(&self, sdp: &str) {
+        // Determine media-line indices (m= lines) to set sdp_mline_index correctly.
+        let mut mline_index: u16 = 0;
+        let mut mid: Option<String> = None;
+        let mut injected = 0u32;
+
+        for line in sdp.lines() {
+            let line = line.trim();
+            if line.starts_with("m=") {
+                if mline_index > 0 || mid.is_some() {
+                    // New m= section: increment index
+                    mline_index += 1;
+                    mid = None;
+                } else {
+                    // First m= line
+                }
+            } else if line.starts_with("a=mid:") {
+                mid = Some(line[6..].to_string());
+            } else if let Some(candidate_attr) = line.strip_prefix("a=candidate:") {
+                // Full candidate string as browsers send it (without "a=" prefix but with "candidate:")
+                let candidate_str = format!("candidate:{candidate_attr}");
+
+                // Skip mDNS candidates (contain .local hostnames)
+                if candidate_str.contains(".local") {
+                    continue;
+                }
+
+                // Skip empty/malformed
+                if candidate_attr.split_whitespace().count() < 8 {
+                    continue;
+                }
+
+                debug!("[Signaling] Injecting non-mDNS candidate: {}", candidate_str);
+                if let Err(err) = self
+                    .peer
+                    .add_ice_candidate(RTCIceCandidateInit {
+                        candidate: candidate_str,
+                        sdp_mid: mid.clone(),
+                        sdp_mline_index: Some(mline_index),
+                        username_fragment: None,
+                    })
+                    .await
+                {
+                    warn!("[Signaling]: failed to inject candidate: {err:?}");
+                } else {
+                    injected += 1;
+                }
+            }
+        }
+
+        if injected > 0 {
+            info!("[Signaling] Injected {injected} non-mDNS candidate(s) from remote SDP");
+        }
     }
 
     // Start Moonlight Stream

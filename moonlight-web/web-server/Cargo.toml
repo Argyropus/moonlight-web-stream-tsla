@@ -32,5 +32,20 @@ totp-rs = { workspace = true }
 data-encoding = { workspace = true }
 hex = { workspace = true }
 
+# Windows system tray + startup
+[target.'cfg(windows)'.dependencies]
+tray-icon = "0.19"
+winreg = "0.55"
+windows = { version = "0.61", features = [
+    "Win32_System_Console",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+] }
+muda = "0.16"
+
+# build.rs needs winresource unconditionally (cross-compile from Linux targets Windows)
+[build-dependencies]
+winresource = "0.1"
+
 [lints]
 workspace = true
