@@ -28,11 +28,12 @@ impl ConnectionListener for StreamConnectionListener {
 
         self.stream.runtime.spawn(async move {
             ipc_sender
-                .send(StreamerIpcMessage::WebSocket(
-                    StreamServerMessage::StageStarting {
+                .send(StreamerIpcMessage::WebSocket {
+                    client_id: 0,
+                    message: StreamServerMessage::StageStarting {
                         stage: stage.name().to_string(),
                     },
-                ))
+                })
                 .await;
         });
     }
@@ -42,11 +43,12 @@ impl ConnectionListener for StreamConnectionListener {
 
         self.stream.runtime.spawn(async move {
             ipc_sender
-                .send(StreamerIpcMessage::WebSocket(
-                    StreamServerMessage::StageComplete {
+                .send(StreamerIpcMessage::WebSocket {
+                    client_id: 0,
+                    message: StreamServerMessage::StageComplete {
                         stage: stage.name().to_string(),
                     },
-                ))
+                })
                 .await;
         });
     }
@@ -56,12 +58,13 @@ impl ConnectionListener for StreamConnectionListener {
 
         self.stream.runtime.spawn(async move {
             ipc_sender
-                .send(StreamerIpcMessage::WebSocket(
-                    StreamServerMessage::StageFailed {
+                .send(StreamerIpcMessage::WebSocket {
+                    client_id: 0,
+                    message: StreamServerMessage::StageFailed {
                         stage: stage.name().to_string(),
                         error_code,
                     },
-                ))
+                })
                 .await;
         });
     }
@@ -77,9 +80,10 @@ impl ConnectionListener for StreamConnectionListener {
 
         self.stream.runtime.spawn(async move {
             ipc_sender
-                .send(StreamerIpcMessage::WebSocket(
-                    StreamServerMessage::ConnectionTerminated { error_code },
-                ))
+                .send(StreamerIpcMessage::WebSocket {
+                    client_id: 0,
+                    message: StreamServerMessage::ConnectionTerminated { error_code },
+                })
                 .await;
         });
 

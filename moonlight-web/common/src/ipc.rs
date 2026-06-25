@@ -31,13 +31,29 @@ pub enum ServerIpcMessage {
         server_certificate_pem: String,
         app_id: u32,
     },
-    WebSocket(StreamClientMessage),
+    WebSocket {
+        client_id: u32,
+        message: StreamClientMessage,
+    },
+    /// Attach a new input-only WebRTC peer (no video/audio) for `client_id`,
+    /// driving the same already-running MoonlightStream.
+    AttachInputClient {
+        client_id: u32,
+    },
+    /// Tear down the input-only peer for `client_id` without affecting the
+    /// primary (client_id 0) AV connection or the underlying MoonlightStream.
+    DetachInputClient {
+        client_id: u32,
+    },
     Stop,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 pub enum StreamerIpcMessage {
-    WebSocket(StreamServerMessage),
+    WebSocket {
+        client_id: u32,
+        message: StreamServerMessage,
+    },
     Stop,
 }
 

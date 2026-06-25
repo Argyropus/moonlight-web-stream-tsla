@@ -255,6 +255,12 @@ pub enum StreamClientMessage {
         video_colorspace: StreamColorspace,
         video_color_range_full: bool,
     },
+    /// Attach as an input-only (keyboard/mouse/touch/controller) client to an
+    /// already-running stream for `host_id`, instead of starting a new one.
+    AuthenticateAndAttachInput {
+        credentials: Option<String>,
+        host_id: u32,
+    },
     Signaling(StreamSignalingMessage),
     /// Client debug log sent on connection failure for remote diagnostics.
     ClientLog {
@@ -294,6 +300,9 @@ pub enum StreamServerMessage {
     AppNotFound,
     HostNotPaired,
     AlreadyStreaming,
+    /// Returned to a client that requested `AuthenticateAndAttachInput` for a
+    /// host with no currently active stream to attach to.
+    StreamNotActive,
     StageStarting {
         stage: String,
     },

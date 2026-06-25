@@ -1,6 +1,8 @@
-use std::{collections::HashMap, path::Path};
+use std::{collections::HashMap, path::Path, sync::Arc};
 
 use actix_web::web::{Bytes, Data};
+use actix_ws::Session;
+use common::ipc::{IpcSender, ServerIpcMessage};
 use futures::future::join_all;
 use log::{info, warn};
 use moonlight_common::{
@@ -17,6 +19,17 @@ use tokio::{
 };
 
 use crate::Config;
+
+/// Tracks the single streamer subprocess currently running for a host, so a
+/// second browser connection can attach an input-only WebRTC peer into it
+/// instead of starting a new Moonlight session (only one is allowed per host).
+pub struct ActiveStream {
+    pub ipc_sender: IpcSender<ServerIpcMessage>,
+    pub next_client_id: u32,
+    /// client_id (0 = primary AV client) -> its WebSocket session, used to
+    /// route StreamerIpcMessage replies back to the right browser connection.
+    pub clients: HashMap<u32, Session>,
+}
 
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct ApiData {
@@ -42,6 +55,7 @@ pub struct RuntimeApiHost {
     pub cache: HostCache,
     pub moonlight: ReqwestMoonlightHost,
     pub app_images_cache: HashMap<u32, Bytes>,
+    pub active_stream: Option<Arc<Mutex<ActiveStream>>>,
 }
 
 impl RuntimeApiHost {
@@ -106,6 +120,7 @@ impl RuntimeApiData {
                 cache: host_data.cache,
                 moonlight: host,
                 app_images_cache: Default::default(),
+                active_stream: None,
             })
         }))
         .await;

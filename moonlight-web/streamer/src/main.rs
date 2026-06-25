@@ -1,4 +1,4 @@
-use std::{panic, process::exit, str::FromStr, sync::Arc};
+use std::{collections::HashMap, panic, process::exit, str::FromStr, sync::Arc};
 
 use common::{
     StreamSettings,
@@ -104,11 +104,12 @@ async fn main() {
 
     // Send stage
     ipc_sender
-        .send(StreamerIpcMessage::WebSocket(
-            StreamServerMessage::StageComplete {
+        .send(StreamerIpcMessage::WebSocket {
+            client_id: 0,
+            message: StreamServerMessage::StageComplete {
                 stage: "Launch Streamer".to_string(),
             },
-        ))
+        })
         .await;
 
     let (
@@ -160,11 +161,12 @@ async fn main() {
 
     // Send stage
     ipc_sender
-        .send(StreamerIpcMessage::WebSocket(
-            StreamServerMessage::StageStarting {
+        .send(StreamerIpcMessage::WebSocket {
+            client_id: 0,
+            message: StreamServerMessage::StageStarting {
                 stage: "Setup WebRTC Peer".to_string(),
             },
-        ))
+        })
         .await;
 
     // Try to use localhost if Sunshine is reachable locally (avoids DNS + NAT hairpin)
@@ -298,7 +300,7 @@ async fn main() {
         stream_settings,
         ipc_sender.clone(),
         ipc_receiver,
-        &api,
+        api,
         rtc_config,
     )
     .await
@@ -306,20 +308,22 @@ async fn main() {
 
     // Send stage
     ipc_sender
-        .send(StreamerIpcMessage::WebSocket(
-            StreamServerMessage::StageComplete {
+        .send(StreamerIpcMessage::WebSocket {
+            client_id: 0,
+            message: StreamServerMessage::StageComplete {
                 stage: "Setup WebRTC Peer".to_string(),
             },
-        ))
+        })
         .await;
 
     // Send stage
     ipc_sender
-        .send(StreamerIpcMessage::WebSocket(
-            StreamServerMessage::StageStarting {
+        .send(StreamerIpcMessage::WebSocket {
+            client_id: 0,
+            message: StreamServerMessage::StageStarting {
                 stage: "WebRTC Peer Negotiation".to_string(),
             },
-        ))
+        })
         .await;
 
     // Start Moonlight/Sunshine stream pre-emptively (in parallel with ICE negotiation).
@@ -372,6 +376,13 @@ struct StreamConnection {
     pub ice_restart_attempted: std::sync::atomic::AtomicBool,
     // Prevents start_stream from being called more than once
     stream_start_initiated: std::sync::atomic::AtomicBool,
+    // Kept around (rather than just consumed in new()) so additional, input-only
+    // peer connections can be created later for clients attaching to this stream.
+    api: API,
+    rtc_config: RTCConfiguration,
+    // client_id (always != 0; 0 is the primary AV peer above) -> its video/audio-free
+    // WebRTC peer, driving the same shared `stream` as the primary connection.
+    secondary_peers: RwLock<HashMap<u32, Arc<RTCPeerConnection>>>,
 }
 
 impl StreamConnection {
@@ -381,13 +392,14 @@ impl StreamConnection {
         settings: StreamSettings,
         mut ipc_sender: IpcSender<StreamerIpcMessage>,
         mut ipc_receiver: IpcReceiver<ServerIpcMessage>,
-        api: &API,
+        api: API,
         config: RTCConfiguration,
     ) -> Result<Arc<Self>, anyhow::Error> {
         // Send WebRTC Info
         ipc_sender
-            .send(StreamerIpcMessage::WebSocket(
-                StreamServerMessage::WebRtcConfig {
+            .send(StreamerIpcMessage::WebSocket {
+                client_id: 0,
+                message: StreamServerMessage::WebRtcConfig {
                     ice_servers: config
                         .ice_servers
                         .iter()
@@ -395,10 +407,10 @@ impl StreamConnection {
                         .map(from_webrtc_ice)
                         .collect(),
                 },
-            ))
+            })
             .await;
 
-        let peer = Arc::new(api.new_peer_connection(config).await?);
+        let peer = Arc::new(api.new_peer_connection(config.clone()).await?);
 
         // -- Input
         let input = StreamInput::new();
@@ -442,6 +454,9 @@ impl StreamConnection {
             terminate: Notify::new(),
             ice_restart_attempted: std::sync::atomic::AtomicBool::new(false),
             stream_start_initiated: std::sync::atomic::AtomicBool::new(false),
+            api,
+            rtc_config: config,
+            secondary_peers: RwLock::new(HashMap::new()),
         });
 
         // Pre-register a bare video transceiver so the initial SDP includes ALL supported
@@ -497,7 +512,7 @@ impl StreamConnection {
             Box::new(move |candidate| {
                 let this = this.clone();
                 Box::pin(async move {
-                    this.on_ice_candidate(candidate).await;
+                    this.on_ice_candidate(0, candidate).await;
                 })
             })
         });
@@ -565,8 +580,8 @@ impl StreamConnection {
         // Do nothing
     }
 
-    async fn send_answer(&self) -> bool {
-        let local_description = match self.peer.create_answer(None).await {
+    async fn send_answer(&self, peer: &Arc<RTCPeerConnection>, client_id: u32) -> bool {
+        let local_description = match peer.create_answer(None).await {
             Err(err) => {
                 warn!("[Signaling]: failed to create answer: {err:?}");
                 return false;
@@ -574,30 +589,27 @@ impl StreamConnection {
             Ok(value) => value,
         };
 
-        if let Err(err) = self
-            .peer
-            .set_local_description(local_description.clone())
-            .await
-        {
+        if let Err(err) = peer.set_local_description(local_description.clone()).await {
             warn!("[Signaling]: failed to set local description: {err:?}");
             return false;
         }
 
         debug!(
-            "[Signaling] Sending Local Description as Answer: {:?}",
+            "[Signaling] Sending Local Description as Answer (client {client_id}): {:?}",
             local_description.sdp
         );
 
         self.ipc_sender
             .clone()
-            .send(StreamerIpcMessage::WebSocket(
-                StreamServerMessage::Signaling(StreamSignalingMessage::Description(
+            .send(StreamerIpcMessage::WebSocket {
+                client_id,
+                message: StreamServerMessage::Signaling(StreamSignalingMessage::Description(
                     RtcSessionDescription {
                         ty: from_webrtc_sdp(local_description.sdp_type),
                         sdp: local_description.sdp,
                     },
                 )),
-            ))
+            })
             .await;
 
         true
@@ -631,34 +643,60 @@ impl StreamConnection {
 
         self.ipc_sender
             .clone()
-            .send(StreamerIpcMessage::WebSocket(
-                StreamServerMessage::Signaling(StreamSignalingMessage::Description(
+            .send(StreamerIpcMessage::WebSocket {
+                client_id: 0,
+                message: StreamServerMessage::Signaling(StreamSignalingMessage::Description(
                     RtcSessionDescription {
                         ty: from_webrtc_sdp(local_description.sdp_type),
                         sdp: local_description.sdp,
                     },
                 )),
-            ))
+            })
             .await;
 
         true
     }
 
-    async fn on_ipc_message(&self, message: ServerIpcMessage) {
+    /// Returns the WebRTC peer for `client_id` (0 = primary AV peer, anything
+    /// else = an attached input-only peer), or `None` if it doesn't exist
+    /// (e.g. it was detached, or the client_id is unknown).
+    async fn peer_for(&self, client_id: u32) -> Option<Arc<RTCPeerConnection>> {
+        if client_id == 0 {
+            Some(self.peer.clone())
+        } else {
+            self.secondary_peers.read().await.get(&client_id).cloned()
+        }
+    }
+
+    async fn on_ipc_message(self: &Arc<Self>, message: ServerIpcMessage) {
         match message {
             ServerIpcMessage::Init { .. } => {}
-            ServerIpcMessage::WebSocket(message) => {
-                self.on_ws_message(message).await;
+            ServerIpcMessage::WebSocket { client_id, message } => {
+                self.on_ws_message(client_id, message).await;
+            }
+            ServerIpcMessage::AttachInputClient { client_id } => {
+                self.attach_input_peer(client_id).await;
+            }
+            ServerIpcMessage::DetachInputClient { client_id } => {
+                self.detach_input_peer(client_id).await;
             }
             ServerIpcMessage::Stop => {
                 self.stop().await;
             }
         }
     }
-    async fn on_ws_message(&self, message: StreamClientMessage) {
+    async fn on_ws_message(&self, client_id: u32, message: StreamClientMessage) {
         match message {
             StreamClientMessage::Signaling(StreamSignalingMessage::Description(description)) => {
-                debug!("[Signaling] Received Remote Description: {:?}", description);
+                let Some(peer) = self.peer_for(client_id).await else {
+                    warn!("[Signaling]: received description for unknown client {client_id}");
+                    return;
+                };
+
+                debug!(
+                    "[Signaling] Received Remote Description (client {client_id}): {:?}",
+                    description
+                );
 
                 // Keep the raw SDP before converting (we'll need it to extract candidates)
                 let raw_sdp = description.sdp.clone();
@@ -682,7 +720,7 @@ impl StreamConnection {
                 };
 
                 let remote_ty = description.sdp_type;
-                if let Err(err) = self.peer.set_remote_description(description).await {
+                if let Err(err) = peer.set_remote_description(description).await {
                     warn!("[Signaling]: failed to set remote description: {err:?}");
                     return;
                 }
@@ -690,20 +728,24 @@ impl StreamConnection {
                 // Workaround for webrtc-rs mDNS resolution stalling candidate pair formation:
                 // Explicitly add non-mDNS candidates from the SDP so that srflx/host IP
                 // candidates always form pairs, even if mDNS resolution is blocked/slow.
-                self.inject_non_mdns_candidates(&raw_sdp).await;
+                self.inject_non_mdns_candidates(&peer, &raw_sdp).await;
 
                 // Send an answer (local description) if we got an offer
                 if remote_ty == RTCSdpType::Offer {
-                    self.send_answer().await;
+                    self.send_answer(&peer, client_id).await;
                 }
             }
             StreamClientMessage::Signaling(StreamSignalingMessage::AddIceCandidate(
                 description,
             )) => {
-                debug!("[Signaling] Received Ice Candidate");
+                let Some(peer) = self.peer_for(client_id).await else {
+                    warn!("[Signaling]: received ice candidate for unknown client {client_id}");
+                    return;
+                };
 
-                if let Err(err) = self
-                    .peer
+                debug!("[Signaling] Received Ice Candidate (client {client_id})");
+
+                if let Err(err) = peer
                     .add_ice_candidate(RTCIceCandidateInit {
                         candidate: description.candidate,
                         sdp_mid: description.sdp_mid,
@@ -717,13 +759,14 @@ impl StreamConnection {
             }
             // This should already be done
             StreamClientMessage::AuthenticateAndInit { .. } => {}
+            StreamClientMessage::AuthenticateAndAttachInput { .. } => {}
             StreamClientMessage::ClientLog { log } => {
                 info!("[Client Log]:\n{log}");
             }
         }
     }
 
-    async fn on_ice_candidate(&self, candidate: Option<RTCIceCandidate>) {
+    async fn on_ice_candidate(&self, client_id: u32, candidate: Option<RTCIceCandidate>) {
         let Some(candidate) = candidate else {
             return;
         };
@@ -733,7 +776,7 @@ impl StreamConnection {
         };
 
         debug!(
-            "[Signaling] Sending Ice Candidate: {}",
+            "[Signaling] Sending Ice Candidate (client {client_id}): {}",
             candidate_json.candidate
         );
 
@@ -748,7 +791,7 @@ impl StreamConnection {
 
         self.ipc_sender
             .clone()
-            .send(StreamerIpcMessage::WebSocket(message))
+            .send(StreamerIpcMessage::WebSocket { client_id, message })
             .await;
     }
 
@@ -757,11 +800,92 @@ impl StreamConnection {
         self.input.on_data_channel(self, channel).await;
     }
 
+    // -- Input-only peers
+    /// Creates a second, video/audio-free WebRTC peer for `client_id`, driving
+    /// the same shared `stream` (MoonlightStream) as the primary AV peer. Used
+    /// when a second browser connection attaches keyboard/mouse/touch input
+    /// to an already-running stream.
+    async fn attach_input_peer(self: &Arc<Self>, client_id: u32) {
+        info!("[Stream]: attaching input-only peer for client {client_id}");
+
+        let peer = match self.api.new_peer_connection(self.rtc_config.clone()).await {
+            Ok(value) => Arc::new(value),
+            Err(err) => {
+                warn!("[Stream]: failed to create input-only peer for client {client_id}: {err:?}");
+                return;
+            }
+        };
+
+        peer.on_ice_candidate({
+            let this = self.clone();
+            Box::new(move |candidate| {
+                let this = this.clone();
+                Box::pin(async move {
+                    this.on_ice_candidate(client_id, candidate).await;
+                })
+            })
+        });
+
+        peer.on_data_channel({
+            let this = self.clone();
+            Box::new(move |channel| {
+                let this = this.clone();
+                Box::pin(async move {
+                    this.on_data_channel(channel).await;
+                })
+            })
+        });
+
+        peer.on_peer_connection_state_change({
+            let this = self.clone();
+            Box::new(move |state| {
+                let this = this.clone();
+                Box::pin(async move {
+                    // No ICE-restart handling for input-only peers: just drop them.
+                    // The primary AV connection's lifecycle is unaffected either way.
+                    if matches!(
+                        state,
+                        RTCPeerConnectionState::Closed | RTCPeerConnectionState::Failed
+                    ) {
+                        this.detach_input_peer(client_id).await;
+                    }
+                })
+            })
+        });
+
+        let ice_servers = self
+            .rtc_config
+            .ice_servers
+            .iter()
+            .cloned()
+            .map(from_webrtc_ice)
+            .collect();
+
+        self.secondary_peers.write().await.insert(client_id, peer);
+
+        self.ipc_sender
+            .clone()
+            .send(StreamerIpcMessage::WebSocket {
+                client_id,
+                message: StreamServerMessage::WebRtcConfig { ice_servers },
+            })
+            .await;
+    }
+
+    /// Tears down the input-only peer for `client_id`, if any. Does not touch
+    /// the primary AV connection or the shared MoonlightStream.
+    async fn detach_input_peer(&self, client_id: u32) {
+        if let Some(peer) = self.secondary_peers.write().await.remove(&client_id) {
+            let _ = peer.close().await;
+            info!("[Stream]: detached input-only peer for client {client_id}");
+        }
+    }
+
     /// Parse non-mDNS `a=candidate:` lines from an SDP and explicitly add them
     /// via `add_ice_candidate()`. This works around a webrtc-rs issue where mDNS
     /// resolution can stall the entire candidate-pair formation pipeline, preventing
     /// srflx and real-IP host candidates from ever being paired.
-    async fn inject_non_mdns_candidates(&self, sdp: &str) {
+    async fn inject_non_mdns_candidates(&self, peer: &Arc<RTCPeerConnection>, sdp: &str) {
         // Determine media-line indices (m= lines) to set sdp_mline_index correctly.
         let mut mline_index: u16 = 0;
         let mut mid: Option<String> = None;
@@ -794,8 +918,7 @@ impl StreamConnection {
                 }
 
                 debug!("[Signaling] Injecting non-mDNS candidate: {}", candidate_str);
-                if let Err(err) = self
-                    .peer
+                if let Err(err) = peer
                     .add_ice_candidate(RTCIceCandidateInit {
                         candidate: candidate_str,
                         sdp_mid: mid.clone(),
@@ -826,11 +949,12 @@ impl StreamConnection {
         // Send stage
         let mut ipc_sender = self.ipc_sender.clone();
         ipc_sender
-            .send(StreamerIpcMessage::WebSocket(
-                StreamServerMessage::StageStarting {
+            .send(StreamerIpcMessage::WebSocket {
+                client_id: 0,
+                message: StreamServerMessage::StageStarting {
                     stage: "Moonlight Stream".to_string(),
                 },
-            ))
+            })
             .await;
 
         let mut host = self.info.host.lock().await;
@@ -885,9 +1009,10 @@ impl StreamConnection {
                 match err {
                     HostError::Moonlight(MoonlightError::ConnectionAlreadyExists) => {
                         ipc_sender
-                            .send(StreamerIpcMessage::WebSocket(
-                                StreamServerMessage::AlreadyStreaming,
-                            ))
+                            .send(StreamerIpcMessage::WebSocket {
+                                client_id: 0,
+                                message: StreamServerMessage::AlreadyStreaming,
+                            })
                             .await;
                     }
                     _ => {}
@@ -917,13 +1042,14 @@ impl StreamConnection {
 
         spawn(async move {
             ipc_sender
-                .send(StreamerIpcMessage::WebSocket(
-                    StreamServerMessage::ConnectionComplete {
+                .send(StreamerIpcMessage::WebSocket {
+                    client_id: 0,
+                    message: StreamServerMessage::ConnectionComplete {
                         capabilities,
                         width,
                         height,
                     },
-                ))
+                })
                 .await;
         });
 
@@ -941,9 +1067,10 @@ impl StreamConnection {
         let mut ipc_sender = self.ipc_sender.clone();
         spawn(async move {
             ipc_sender
-                .send(StreamerIpcMessage::WebSocket(
-                    StreamServerMessage::PeerDisconnect,
-                ))
+                .send(StreamerIpcMessage::WebSocket {
+                    client_id: 0,
+                    message: StreamServerMessage::PeerDisconnect,
+                })
                 .await;
         });
 
@@ -966,6 +1093,11 @@ impl StreamConnection {
         {
             warn!("[Stream]: failed to stop stream: {err}");
         };
+
+        // Close any attached input-only peers too — the process is exiting.
+        for (_, peer) in self.secondary_peers.write().await.drain() {
+            let _ = peer.close().await;
+        }
 
         let mut ipc_sender = self.ipc_sender.clone();
         ipc_sender.send(StreamerIpcMessage::Stop).await;

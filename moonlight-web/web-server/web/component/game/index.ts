@@ -105,6 +105,11 @@ export class Game implements Component {
                         this.divElement.dispatchEvent(event)
                     }
                 })
+
+                elements.push({
+                    name: "Attach Input Only",
+                    callback: this.attachInputOnly.bind(this)
+                })
             }
 
             elements.push({
@@ -141,6 +146,18 @@ export class Game implements Component {
             window.location.href = buildUrl(`/stream.html?${query}`)
         } else {
             window.open(buildUrl(`/stream.html?${query}`), "_blank")
+        }
+    }
+
+    private attachInputOnly() {
+        const query = new URLSearchParams({
+            hostId: this.getHostId(),
+        } as any)
+
+        if (window.matchMedia('(display-mode: standalone)').matches) {
+            window.location.href = buildUrl(`/input.html?${query}`)
+        } else {
+            window.open(buildUrl(`/input.html?${query}`), "_blank")
         }
     }
 

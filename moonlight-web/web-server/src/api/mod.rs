@@ -136,6 +136,7 @@ async fn put_host(
         },
         moonlight: host,
         app_images_cache: Default::default(),
+        active_stream: None,
     }));
 
     drop(hosts);

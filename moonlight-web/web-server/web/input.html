@@ -1,0 +1,35 @@
+<!-- input.html -->
+<!DOCTYPE html>
+<html lang="en" class="stream">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Input Only</title>
+    <link rel="icon" href="resources/moonlight.svg" sizes="any" type="image/svg+xml">
+    <link rel="stylesheet" href="styles.css" />
+    <script type="module" src="input.js" defer></script>
+</head>
+
+<body class="stream">
+    <!-- Modal -->
+    <div id="modal-overlay" class="modal-background modal-disabled">
+        <!-- Modal Content -->
+        <div id="modal-parent" class="modal-content">
+        </div>
+    </div>
+
+    <!-- Errors -->
+    <div id="error-list">
+    </div>
+
+    <!-- A dummy element for capturing inputs -->
+    <div id="input" tabindex="0"></div>
+
+    <!-- Main App View -->
+    <div id="root">
+    </div>
+
+</body>
+
+</html>
