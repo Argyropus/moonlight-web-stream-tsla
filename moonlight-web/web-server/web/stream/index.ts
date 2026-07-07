@@ -14,7 +14,7 @@ type AudioDecodeWorkerInMessage =
     | { type: "use-main-thread" }
 
 type AudioDecodeWorkerOutMessage =
-    | { type: "ready" }
+    | { type: "ready"; engine: "native" | "wasm" }
     | { type: "decoded"; left: ArrayBuffer; right: ArrayBuffer }
     | { type: "error"; message: string }
 
@@ -61,6 +61,8 @@ export type StreamWorkerDiagnostics = {
     audioWorkerActive: boolean
     audioWorkerError: string | null
     audioDecoderMode: "worker" | "main-thread" | "not-ready"
+    /** Which Opus decoder the worker picked: browser-native AudioDecoder or the WASM fallback. */
+    audioDecodeEngine: "native" | "wasm" | null
 }
 
 export function getStreamerSize(settings: StreamSettings, viewerScreenSize: [number, number]): [number, number] {
@@ -113,6 +115,7 @@ export class Stream {
     private audioDecodeWorkerAllowed: boolean
     private audioDecodeWorkerInitAttempted: boolean = false
     private audioDecodeWorkerInitError: string | null = null
+    private audioDecodeWorkerEngine: "native" | "wasm" | null = null
     private audioDecodeWorkerInitTimeoutId: ReturnType<typeof setTimeout> | null = null
     private decoderInitInFlight: boolean = false
     private audioDecoderReady: boolean = false
@@ -289,7 +292,8 @@ export class Stream {
                     this.useAudioDecodeWorker = true
                     this.decoderInitInFlight = false
                     this.audioDecodeWorkerInitError = null
-                    this.debugLog("Audio decode worker ready")
+                    this.audioDecodeWorkerEngine = data.engine ?? "wasm"
+                    this.debugLog(`Audio decode worker ready (${this.audioDecodeWorkerEngine} opus decoder)`)
                     // If worklet is already ready, wire direct channel now.
                     // If we are in fallback mode (no worklet), tell the worker to
                     // send decoded frames back to the main thread instead.
@@ -929,9 +933,23 @@ export class Stream {
     // -- Track and Data Channels
     private onTrack(event: RTCTrackEvent) {
 
-        if (event.receiver && "playoutDelayHint" in event.receiver) {
-            // @ts-ignore
-            event.receiver.playoutDelayHint = 0;
+        if (event.receiver) {
+            // 0 = lowest latency; raising it lets the browser's jitter buffer
+            // absorb network jitter (smoother on LTE) at the cost of latency.
+            const targetMs = Math.max(0, this.settings.jitterBufferMs ?? 0)
+            if ("jitterBufferTarget" in event.receiver) {
+                try {
+                    // @ts-ignore
+                    event.receiver.jitterBufferTarget = targetMs;
+                } catch (e) {
+                    this.debugLog(`Failed to set jitterBufferTarget: ${e}`)
+                }
+            }
+            if ("playoutDelayHint" in event.receiver) {
+                // @ts-ignore
+                event.receiver.playoutDelayHint = targetMs / 1000;
+            }
+            this.debugLog(`Receiver jitter buffer target: ${targetMs}ms`)
         }
 
         if(!this.settings?.canvasRenderer) {
@@ -1059,8 +1077,15 @@ export class Stream {
         }
 
         // Main-thread fallback: ring buffer + batched drain to avoid blocking rAF.
+        // On overflow drop the oldest packet — letting head lap tail would make the
+        // whole ring look empty and later replay stale packets.
+        const nextHead = (this.audioRingHead + 1) & this.audioRingMask;
+        if (nextHead === this.audioRingTail) {
+            this.audioRingBuffer[this.audioRingTail] = null;
+            this.audioRingTail = (this.audioRingTail + 1) & this.audioRingMask;
+        }
         this.audioRingBuffer[this.audioRingHead] = packet;
-        this.audioRingHead = (this.audioRingHead + 1) & this.audioRingMask;
+        this.audioRingHead = nextHead;
         if (!this.audioDrainScheduled) {
             this.audioDrainScheduled = true;
             this.drainAudioQueue();
@@ -1105,9 +1130,13 @@ export class Stream {
     private wsConnectTimeout: ReturnType<typeof setTimeout> | null = null
     private beforeUnloadHandler: (() => void) | null = null
     private wsAttempt: number = 0
+    private wsOpened: boolean = false
     private readonly WS_MAX_ATTEMPTS = 10
     private readonly WS_CONNECT_TIMEOUT_MS = 5000
     private readonly WS_RETRY_DELAY_MS = 0
+    // Used when the socket is refused/closed before it ever opened — retrying
+    // instantly would burn all attempts in under a second.
+    private readonly WS_REFUSED_RETRY_DELAY_MS = 500
     private pendingAuthMessage: any = null
     // Serializes WebSocket message processing so messages are handled one-at-a-time
     // in arrival order. Without this, an ICE candidate message can race with the
@@ -1117,6 +1146,7 @@ export class Stream {
 
     private connectWebSocket() {
         this.wsAttempt++
+        this.wsOpened = false
         const attempt = this.wsAttempt
         this.debugLog(`WebSocket connect attempt ${attempt}/${this.WS_MAX_ATTEMPTS}`)
 
@@ -1155,6 +1185,7 @@ export class Stream {
 
     private onWsOpen() {
         this.debugLog(`Web Socket Open (attempt ${this.wsAttempt}/${this.WS_MAX_ATTEMPTS})`)
+        this.wsOpened = true
 
         if (this.wsConnectTimeout !== null) {
             clearTimeout(this.wsConnectTimeout)
@@ -1185,6 +1216,19 @@ export class Stream {
         // will handle the retry or final failure.
         if (this.wsAttempt < this.WS_MAX_ATTEMPTS && this.wsConnectTimeout === null) {
             // Closed by our timeout handler, retry is pending — suppress error
+            return
+        }
+
+        // Refused/closed before ever opening (e.g. server restarting) while
+        // attempts remain: retry now instead of showing an error and waiting
+        // for the 5s connect timeout to fire.
+        if (!this.wsOpened && this.wsAttempt < this.WS_MAX_ATTEMPTS) {
+            if (this.wsConnectTimeout !== null) {
+                clearTimeout(this.wsConnectTimeout)
+                this.wsConnectTimeout = null
+            }
+            this.debugLog(`WebSocket closed before opening, retrying in ${this.WS_REFUSED_RETRY_DELAY_MS}ms`)
+            setTimeout(() => this.connectWebSocket(), this.WS_REFUSED_RETRY_DELAY_MS)
             return
         }
 
@@ -1295,6 +1339,7 @@ export class Stream {
             audioWorkerActive: this.useAudioDecodeWorker,
             audioWorkerError: this.audioDecodeWorkerInitError,
             audioDecoderMode: this.audioDecoderReady ? (this.useAudioDecodeWorker ? "worker" : "main-thread") : "not-ready",
+            audioDecodeEngine: this.useAudioDecodeWorker ? this.audioDecodeWorkerEngine : (this.audioDecoderReady ? "wasm" : null),
         }
     }
 

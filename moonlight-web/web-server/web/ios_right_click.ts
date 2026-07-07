@@ -100,8 +100,8 @@ function onTouchEnd(event: TouchEvent) {
             cancellable: true
         };
 
-        if (touch.clientX - touchStart.originX < RIGHT_CLICK_MAX_MOVE
-            && touch.clientY - touchStart.originY < RIGHT_CLICK_MAX_MOVE) {
+        if (Math.abs(touch.clientX - touchStart.originX) < RIGHT_CLICK_MAX_MOVE
+            && Math.abs(touch.clientY - touchStart.originY) < RIGHT_CLICK_MAX_MOVE) {
             if (timeDiff > RIGHT_CLICK_TIME_MS) {
                 // dispatch fake context menu event
                 const contextMenuEvent = new MouseEvent("contextmenu", eventInit)

@@ -29,8 +29,22 @@ where
         }
     }
 
+    /// Never panics, even on a truncated/malformed buffer: this parses
+    /// input messages coming straight from a connected WebRTC client, and a
+    /// short/garbled message must not be able to crash the whole streamer
+    /// process (a panic anywhere in this process triggers `exit(0)` via the
+    /// panic hook in main.rs, tearing down the stream for every connected
+    /// client). Missing bytes are treated as zero.
     pub fn get_u8_array(&mut self, array: &mut [u8]) {
-        array.copy_from_slice(&self.buffer.as_ref()[self.position..(self.position + array.len())]);
+        let data = self.buffer.as_ref();
+        let available = data.len().saturating_sub(self.position);
+        let to_copy = available.min(array.len());
+
+        array[..to_copy].copy_from_slice(&data[self.position..self.position + to_copy]);
+        if to_copy < array.len() {
+            array[to_copy..].fill(0);
+        }
+
         self.position += array.len();
     }
     pub fn get_u8(&mut self) -> u8 {
@@ -77,16 +91,28 @@ where
             return Ok("");
         }
 
-        let Some(chunk) = &self.buffer.as_ref()[self.position..].utf8_chunks().next() else {
+        let position = self.position;
+        let data = self.buffer.as_ref();
+        if position > data.len() {
+            return Err(Utf8Error::BufferTooSmall);
+        }
+
+        let Some(chunk) = data[position..].utf8_chunks().next() else {
             return Err(Utf8Error::InvalidChunks);
         };
         let Some((end_char_index, end_char)) = chunk.valid().char_indices().nth(characters - 1)
         else {
             return Err(Utf8Error::BufferTooSmall);
         };
-        let output = &chunk.valid()[0..end_char_index + (end_char.len_utf8())];
+        let consumed = end_char_index + end_char.len_utf8();
 
-        Ok(output)
+        // Unlike every other get_* method, this previously never advanced
+        // `position`, so any read after a get_utf8() call would re-read from
+        // the same offset instead of past the consumed string.
+        self.position += consumed;
+
+        std::str::from_utf8(&self.buffer.as_ref()[position..position + consumed])
+            .map_err(|_| Utf8Error::InvalidChunks)
     }
 
     pub fn get_u32(&mut self) -> u32 {

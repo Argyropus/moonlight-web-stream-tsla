@@ -18,6 +18,9 @@ export type StreamSettings = {
         height: number
     },
     fps: number
+    /** Receiver jitter buffer target in ms. 0 = lowest latency (parked on WiFi);
+     * 50-100 trades latency for smoothness on jittery links (LTE). */
+    jitterBufferMs: number
     dontForceH264: boolean
     canvasRenderer: boolean
     playAudioLocal: boolean
@@ -39,6 +42,7 @@ export function defaultStreamSettings(): StreamSettings {
         bitrate: 12000,
         packetSize: 1024,
         fps: 120,
+        jitterBufferMs: 0,
         videoSampleQueueSize: 1,
         videoSize: "1080p",
         videoSizeCustom: {
@@ -111,6 +115,7 @@ export class StreamSettingsComponent implements Component {
     private bitrate: InputComponent
     private packetSize: InputComponent
     private fps: InputComponent
+    private jitterBufferMs: InputComponent
     private forceH264: InputComponent
     private canvasRenderer: InputComponent
 
@@ -266,6 +271,15 @@ export class StreamSettingsComponent implements Component {
         })
         this.bitrate.addChangeListener(this.onSettingsChange.bind(this))
         this.bitrate.mount(basicSection)
+
+        // Jitter buffer target: 0 = lowest latency, higher absorbs network jitter
+        this.jitterBufferMs = new InputComponent("jitterBufferMs", "number", "Jitter Buffer ms (0 = lowest latency, 50-100 = smoother on LTE)", {
+            defaultValue: defaultSettings.jitterBufferMs.toString(),
+            value: settings?.jitterBufferMs?.toString(),
+            step: "25"
+        })
+        this.jitterBufferMs.addChangeListener(this.onSettingsChange.bind(this))
+        this.jitterBufferMs.mount(basicSection)
 
         // --- Audio Settings ---
         const audioSection = createSection("Audio Settings")
@@ -538,6 +552,7 @@ export class StreamSettingsComponent implements Component {
         settings.bitrate = parseInt(this.bitrate.getValue())
         settings.packetSize = parseInt(this.packetSize.getValue())
         settings.fps = parseInt(this.fps.getValue())
+        settings.jitterBufferMs = Math.max(0, parseInt(this.jitterBufferMs.getValue()) || 0)
         settings.videoSize = this.videoSize.getValue() as any
         settings.videoSizeCustom = {
             width: parseInt(this.videoSizeWidth.getValue()),

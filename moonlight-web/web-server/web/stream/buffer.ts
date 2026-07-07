@@ -91,7 +91,7 @@ export class ByteBuffer {
         return byte
     }
     getU16(): number {
-        const byte = this.view.getUint16(this.position)
+        const byte = this.view.getUint16(this.position, this.littleEndian)
         this.bytesUsed(2, true)
         return byte
     }

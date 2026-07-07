@@ -53,7 +53,7 @@ export class ListComponent<T extends Component> implements Component {
     }
     private onAnimElementRemoved(index: number) {
         let element
-        while ((element = this.divElements[index]).classList.contains("list-show")) {
+        while ((element = this.divElements[index]) && element.classList.contains("list-show")) {
             element.classList.remove("list-show")
         }
     }
@@ -93,6 +93,10 @@ export class ListComponent<T extends Component> implements Component {
             this.internalUnmountUntil(index)
 
             this.list.splice(index, 0, value)
+            // Keep divElements aligned with list: insert a placeholder slot so
+            // divAt() creates a fresh div here, instead of every later index's
+            // div sliding out of sync with the item it's supposed to render.
+            this.divElements.splice(index, 0, undefined as unknown as HTMLDivElement)
 
             this.internalMountFrom(index)
         }
@@ -102,7 +106,7 @@ export class ListComponent<T extends Component> implements Component {
     remove(index: number): T | null {
         if (index == this.list.length - 1) {
             const element = this.list.pop()
-            const divElement = this.divElements[index]
+            const divElement = this.divElements.pop()
 
             if (element && divElement) {
                 element.unmount(divElement)
@@ -114,6 +118,10 @@ export class ListComponent<T extends Component> implements Component {
             this.internalUnmountUntil(index)
 
             const element = this.list.splice(index, 1)
+            // Keep divElements aligned with list (see insert()) — without
+            // this, every item after `index` gets remounted into the wrong
+            // (stale) div, and the removed item's div is never released.
+            this.divElements.splice(index, 1)
 
             this.internalMountFrom(index)
 

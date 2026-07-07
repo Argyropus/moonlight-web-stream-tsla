@@ -1021,7 +1021,7 @@ async fn run_attach_input(
             // In practice this shouldn't happen unless there are millions of reconnects,
             // but gamepads are only freed when clients disconnect, so accumulated connections
             // could theoretically hit this.
-            if client_id >= u32::MAX {
+            if client_id == u32::MAX {
                 active.next_client_id = 1;
             } else {
                 active.next_client_id += 1;

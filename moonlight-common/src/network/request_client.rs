@@ -81,6 +81,17 @@ pub trait RequestClient: Sized {
         server_certificate: &Pem,
     ) -> Result<Self, Self::Error>;
 
+    /// Same as [`Self::with_certificates`], but with the long request timeout
+    /// (see [`Self::with_defaults_long_timeout`]). Used for requests that can
+    /// legitimately take longer than the normal short status-check timeout,
+    /// e.g. launching/resuming a session, where the host may need several
+    /// seconds to cold-start the app before responding.
+    fn with_certificates_long_timeout(
+        client_private_key: &Pem,
+        client_certificate: &Pem,
+        server_certificate: &Pem,
+    ) -> Result<Self, Self::Error>;
+
     fn send_http_request_text_response(
         &mut self,
         hostport: &str,

@@ -165,11 +165,14 @@ impl H265Reader {
     /// Read the next NAL unit from the Annex-B stream..
     /// The BytesMut contains the annex-b start code
     pub fn next_nal(&mut self) -> Option<Nal> {
-        if let Some(annex_b) = self.annex_b.next() {
+        loop {
+            let annex_b = self.annex_b.next()?;
             let header_range = annex_b.payload_range.start..(annex_b.payload_range.start + 2);
-            
+
             if annex_b.full.len() < header_range.end {
-                return None; // or continue?
+                // Truncated/malformed NAL — skip just this one, not the rest
+                // of the frame (matches H264Reader's behavior).
+                continue;
             }
 
             let mut header = [0u8; 2];
@@ -178,16 +181,14 @@ impl H265Reader {
 
             let payload_range = header_range.end..annex_b.payload_range.end;
 
-            Some(Nal {
+            return Some(Nal {
                 payload_range,
                 header,
                 header_range,
                 start_code: annex_b.start_code,
                 start_code_range: annex_b.start_code_range,
                 full: annex_b.full,
-            })
-        } else {
-            None
+            });
         }
     }
 

@@ -54,6 +54,14 @@ fn totp_uri(secret_base32: &str) -> String {
     )
 }
 
+/// Compare secrets without leaking their length or a matching prefix through
+/// timing: hashing first makes the `memcmp` input length fixed.
+fn constant_time_str_eq(a: &str, b: &str) -> bool {
+    let a = openssl::sha::sha256(a.as_bytes());
+    let b = openssl::sha::sha256(b.as_bytes());
+    openssl::memcmp::eq(&a, &b)
+}
+
 /// Verify a 6-digit TOTP code. Allows ±1 step (±30 s) to tolerate clock skew.
 fn verify_totp_code(secret_base32: &str, code: &str) -> bool {
     let upper = secret_base32.to_ascii_uppercase();
@@ -174,7 +182,10 @@ impl ApiCredentials {
     pub fn authenticate_with_credentials(&self, provided: Option<&str>) -> bool {
         match &self.credentials {
             None => true,
-            Some(expected) => provided == Some(expected.as_str()),
+            Some(expected) => match provided {
+                Some(provided) => constant_time_str_eq(provided, expected),
+                None => false,
+            },
         }
     }
 

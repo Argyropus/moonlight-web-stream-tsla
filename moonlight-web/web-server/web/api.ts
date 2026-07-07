@@ -354,8 +354,9 @@ export async function fetchApi(api: Api, endpoint: string, method: string = "get
 
     const timeoutAbort = new AbortController()
     request.signal = timeoutAbort.signal
+    let timeoutId: ReturnType<typeof setTimeout> | null = null
     if (!init?.noTimeout) {
-        setTimeout(() => timeoutAbort.abort(
+        timeoutId = setTimeout(() => timeoutAbort.abort(
             new FetchError("timeout", endpoint, method)
         ), API_TIMEOUT)
     }
@@ -369,6 +370,13 @@ export async function fetchApi(api: Api, endpoint: string, method: string = "get
             throw timeoutAbort.signal.reason
         }
         throw e
+    } finally {
+        // Without this, every call (including frequently-polled ones like the
+        // host list) leaves a dangling timer alive for up to API_TIMEOUT after
+        // the request already settled.
+        if (timeoutId !== null) {
+            clearTimeout(timeoutId)
+        }
     }
 
     if (!response.ok) {

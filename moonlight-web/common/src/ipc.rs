@@ -193,24 +193,27 @@ where
             return None;
         }
 
-        let line = match self.read.next_line().await {
-            Ok(Some(value)) => value,
-            Ok(None) => return None,
-            Err(err) => {
-                self.errored = true;
+        // A malformed line must not be treated as end-of-stream: every caller
+        // uses `while let Some(..) = recv()` as its message loop, so returning
+        // `None` here would tear down the whole stream over one bad message.
+        loop {
+            let line = match self.read.next_line().await {
+                Ok(Some(value)) => value,
+                Ok(None) => return None,
+                Err(err) => {
+                    self.errored = true;
 
-                warn!("[Ipc]: failed to read next line {err:?}");
+                    warn!("[Ipc]: failed to read next line {err:?}");
 
-                return None;
-            }
-        };
+                    return None;
+                }
+            };
 
-        match serde_json::from_str::<Message>(&line) {
-            Ok(value) => Some(value),
-            Err(err) => {
-                warn!("[Ipc]: failed to deserialize message: {err:?}");
-
-                None
+            match serde_json::from_str::<Message>(&line) {
+                Ok(value) => return Some(value),
+                Err(err) => {
+                    warn!("[Ipc]: failed to deserialize message, skipping it: {err:?}");
+                }
             }
         }
     }

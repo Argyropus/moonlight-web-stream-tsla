@@ -9,6 +9,13 @@ export class HostList extends FetchListComponent<DetailedHost | UndetailedHost, 
 
     private eventTarget = new EventTarget()
 
+    // Bound once so add/removeEventListener (used by add/removeHostRemoveListener
+    // and add/removeHostOpenListener) can be paired against the exact same
+    // function reference — a fresh .bind(this) per call never matches an
+    // earlier one, so listener removal would silently no-op otherwise.
+    private readonly boundRemoveHostListener = this.removeHostListener.bind(this)
+    private readonly boundOnHostOpenEvent = this.onHostOpenEvent.bind(this)
+
     constructor(api: Api) {
         super({
             listClasses: ["host-list"],
@@ -39,14 +46,14 @@ export class HostList extends FetchListComponent<DetailedHost | UndetailedHost, 
 
         this.list.append(newHost)
 
-        newHost.addHostRemoveListener(this.removeHostListener.bind(this))
-        newHost.addHostOpenListener(this.onHostOpenEvent.bind(this))
+        newHost.addHostRemoveListener(this.boundRemoveHostListener)
+        newHost.addHostOpenListener(this.boundOnHostOpenEvent)
     }
     public removeList(listIndex: number): void {
         const hostComponent = this.list.remove(listIndex)
 
-        hostComponent?.addHostOpenListener(this.onHostOpenEvent.bind(this))
-        hostComponent?.removeHostRemoveListener(this.removeHostListener.bind(this))
+        hostComponent?.removeHostOpenListener(this.boundOnHostOpenEvent)
+        hostComponent?.removeHostRemoveListener(this.boundRemoveHostListener)
     }
 
     private removeHostListener(event: ComponentEvent<Host>) {

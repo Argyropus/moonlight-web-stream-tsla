@@ -36,6 +36,27 @@ fn timeout_builder() -> ClientBuilder {
     default_builder().timeout(Duration::from_secs(2))
 }
 
+fn build_client_with_certificates(
+    builder: ClientBuilder,
+    client_private_key: &Pem,
+    client_certificate: &Pem,
+    server_certificate: &Pem,
+) -> Result<Client, ReqwestError> {
+    let server_cert = Certificate::from_pem(server_certificate.to_string().as_bytes())?;
+
+    let identity = Identity::from_pkcs8_pem(
+        client_certificate.to_string().as_bytes(),
+        client_private_key.to_string().as_bytes(),
+    )?;
+
+    Ok(builder
+        .tls_built_in_root_certs(false)
+        .add_root_certificate(server_cert)
+        .identity(identity)
+        .danger_accept_invalid_hostnames(true)
+        .build()?)
+}
+
 fn build_url(
     use_https: bool,
     hostport: &str,
@@ -70,24 +91,25 @@ impl RequestClient for Client {
         client_certificate: &Pem,
         server_certificate: &Pem,
     ) -> Result<Self, Self::Error> {
-        let server_cert = Certificate::from_pem(server_certificate.to_string().as_bytes())?;
+        build_client_with_certificates(
+            timeout_builder(),
+            client_private_key,
+            client_certificate,
+            server_certificate,
+        )
+    }
 
-        let mut client_pem = String::new();
-        client_pem.push_str(&client_private_key.to_string());
-        client_pem.push('\n');
-        client_pem.push_str(&client_certificate.to_string());
-
-        let identity = Identity::from_pkcs8_pem(
-            client_certificate.to_string().as_bytes(),
-            client_private_key.to_string().as_bytes(),
-        )?;
-
-        Ok(timeout_builder()
-            .tls_built_in_root_certs(false)
-            .add_root_certificate(server_cert)
-            .identity(identity)
-            .danger_accept_invalid_hostnames(true)
-            .build()?)
+    fn with_certificates_long_timeout(
+        client_private_key: &Pem,
+        client_certificate: &Pem,
+        server_certificate: &Pem,
+    ) -> Result<Self, Self::Error> {
+        build_client_with_certificates(
+            default_builder(),
+            client_private_key,
+            client_certificate,
+            server_certificate,
+        )
     }
 
     async fn send_http_request_text_response(

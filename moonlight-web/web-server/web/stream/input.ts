@@ -223,14 +223,24 @@ export class StreamInput {
         trySendChannel(this.keyboard, this.buffer)
     }
     sendText(text: string) {
-        this.buffer.reset()
+        // The length byte is a Unicode code-point count (the server reads it as
+        // characters, not UTF-16 units or bytes), and it's a u8 — so split into
+        // code points and send in chunks of at most 255. This keeps emoji/other
+        // non-BMP characters working and prevents long pastes from wrapping the
+        // length byte or overflowing the send buffer.
+        const codePoints = Array.from(text)
+        for (let start = 0; start < codePoints.length; start += 255) {
+            const chunk = codePoints.slice(start, start + 255)
 
-        this.buffer.putU8(1)
+            this.buffer.reset()
 
-        this.buffer.putU8(text.length)
-        this.buffer.putUtf8(text)
+            this.buffer.putU8(1)
 
-        trySendChannel(this.keyboard, this.buffer)
+            this.buffer.putU8(chunk.length)
+            this.buffer.putUtf8(chunk.join(""))
+
+            trySendChannel(this.keyboard, this.buffer)
+        }
     }
 
     // -- Mouse

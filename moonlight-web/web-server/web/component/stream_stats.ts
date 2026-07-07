@@ -7,6 +7,7 @@ type WorkerDiagnosticsSnapshot = {
         audioWorkerAttempted: boolean
         audioWorkerActive: boolean
         audioWorkerError: string | null
+        audioDecodeEngine: "native" | "wasm" | null
     } | null
     canvas: {
         attempted: boolean
@@ -406,7 +407,7 @@ export class StreamStatsOverlay implements Component {
 
         if (workerDiag) {
             if (workerDiag.stream) {
-                this.elWorkerAudio.textContent = `mode=${workerDiag.stream.audioDecoderMode}, active=${workerDiag.stream.audioWorkerActive}, attempted=${workerDiag.stream.audioWorkerAttempted}, err=${workerDiag.stream.audioWorkerError ?? "none"}`
+                this.elWorkerAudio.textContent = `mode=${workerDiag.stream.audioDecoderMode}, engine=${workerDiag.stream.audioDecodeEngine ?? "?"}, active=${workerDiag.stream.audioWorkerActive}, attempted=${workerDiag.stream.audioWorkerAttempted}, err=${workerDiag.stream.audioWorkerError ?? "none"}`
             } else {
                 this.elWorkerAudio.textContent = "unavailable"
             }

@@ -128,7 +128,6 @@ where
         if self.tried_connect && !has_cache {
             return Err(HostError::LikelyOffline);
         }
-        self.tried_connect = true;
 
         if !has_cache {
             let http_address = self.http_address();
@@ -138,7 +137,18 @@ where
                 uuid: Uuid::new_v4(),
             };
 
-            let info = host_info(&mut self.client, false, &http_address, Some(client_info)).await?;
+            // Only mark "tried and failed" once we actually know the call
+            // failed — setting this unconditionally before the request would
+            // permanently short-circuit every future call (via the guard
+            // above) after a single transient network error, even though
+            // the host might answer fine on the very next attempt.
+            let info = match host_info(&mut self.client, false, &http_address, Some(client_info)).await {
+                Ok(value) => value,
+                Err(err) => {
+                    self.tried_connect = true;
+                    return Err(err.into());
+                }
+            };
 
             https_port = Some(info.https_port);
 
@@ -250,7 +260,10 @@ where
         use crate::stream::bindings::ServerCodeModeSupport;
 
         let bits = self.server_codec_mode_support_raw().await?;
-        Ok(ServerCodeModeSupport::from_bits(bits).expect("valid server code mode support"))
+        // `from_bits_truncate` (not `from_bits`) so a host firmware reporting
+        // a codec-support bit newer than this crate's `ServerCodeModeSupport`
+        // definition doesn't panic — it just ignores the unrecognized bit(s).
+        Ok(ServerCodeModeSupport::from_bits_truncate(bits))
     }
 
     pub fn set_pairing_info(
@@ -271,6 +284,12 @@ where
             server_certificate: server_certificate.clone(),
             cache_app_list: None,
         });
+
+        // Any previously cached HostInfo (e.g. fetched over plain HTTP before
+        // pairing) may be missing fields only available once authenticated,
+        // and would otherwise be served indefinitely since host_info() only
+        // re-fetches when there's no cache.
+        self.clear_cache();
 
         Ok(())
     }
@@ -479,7 +498,7 @@ mod stream {
     use crate::{
         high::{HostError, MoonlightHost, StreamConfigError},
         network::{
-            ClientInfo,
+            ApiError, ClientInfo,
             launch::{ClientStreamRequest, host_launch, host_resume},
             request_client::RequestClient,
         },
@@ -648,10 +667,30 @@ mod stream {
                 uuid: Uuid::new_v4(),
             };
 
+            // Launch/resume can legitimately take longer than the 2s timeout
+            // used for the rest of this client's calls (cold app start,
+            // driver/GPU init) — use a longer-timeout client just for this
+            // request so a slow-but-successful launch doesn't spuriously
+            // fail. Falls back to the normal client if somehow unpaired
+            // (shouldn't happen — reaching this point requires it).
+            let mut long_timeout_client;
+            let launch_client: &mut C = match self.paired.as_ref() {
+                Some(paired) => {
+                    long_timeout_client = C::with_certificates_long_timeout(
+                        &paired.client_private_key,
+                        &paired.client_certificate,
+                        &paired.server_certificate,
+                    )
+                    .map_err(ApiError::RequestClient)?;
+                    &mut long_timeout_client
+                }
+                None => &mut self.client,
+            };
+
             let rtsp_session_url = if current_game == 0 {
                 let launch_response = host_launch(
                     instance,
-                    &mut self.client,
+                    launch_client,
                     &https_address,
                     client_info,
                     request,
@@ -662,7 +701,7 @@ mod stream {
             } else {
                 let resume_response = host_resume(
                     instance,
-                    &mut self.client,
+                    launch_client,
                     &https_address,
                     client_info,
                     request,

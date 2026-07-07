@@ -1,9 +1,11 @@
-﻿use std::sync::Arc;
+﻿use std::collections::VecDeque;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU16, Ordering};
+use std::time::{Duration, Instant};
 
 use log::warn;
 use tokio::sync::{
-    mpsc::{Receiver, Sender, channel},
+    mpsc::{Receiver, Sender, channel, error::TryRecvError},
 };
 use webrtc::{
     media::Sample,
@@ -42,6 +44,21 @@ where
         }
     }
 
+    /// Pacing rate for the token-bucket sender: 3x the configured stream
+    /// bitrate, so sustained throughput is never limited — only bursts far
+    /// above the stream rate get smoothed. The floor only guards against a
+    /// degenerate near-zero bitrate; it must stay well under the lowest real
+    /// preset (1.5 Mbps) or it defeats pacing on exactly the low-bandwidth/
+    /// cellular configs this exists to help (a flat 3 MB/s floor here
+    /// previously did exactly that — 1.5 Mbps and 3 Mbps presets were paced
+    /// at 24 Mbps instead of their intended 4.5/9 Mbps).
+    fn pace_bytes_per_sec(&self) -> u64 {
+        // settings.bitrate is in kbps -> *125 = bytes/sec
+        (self.stream.settings.bitrate as u64 * 125)
+            .saturating_mul(3)
+            .max(200_000)
+    }
+
     pub fn blocking_create_track(
         &mut self,
         track: Track,
@@ -53,10 +70,11 @@ where
 
         let (sender, receiver) = channel(self.channel_queue_size);
 
+        let pace_bytes_per_sec = self.pace_bytes_per_sec();
         self.stream.runtime.spawn({
             let track = track.clone();
             async move {
-                sample_sender(track, receiver).await;
+                sample_sender(track, receiver, pace_bytes_per_sec).await;
             }
         });
 
@@ -110,10 +128,11 @@ impl TrackLocalSender<SequencedTrackLocalStaticRTP> {
 
         let (sender, receiver) = channel(self.channel_queue_size);
 
+        let pace_bytes_per_sec = self.pace_bytes_per_sec();
         self.stream.runtime.spawn({
             let track = sequenced.clone();
             async move {
-                sample_sender(track, receiver).await;
+                sample_sender(track, receiver, pace_bytes_per_sec).await;
             }
         });
 
@@ -131,8 +150,16 @@ impl TrackLocalSender<SequencedTrackLocalStaticRTP> {
     }
 }
 
-async fn sample_sender<Track>(track: Arc<Track>, mut receiver: Receiver<Track::Sample>)
-where
+/// Safety valve for the pacer's local queue: ~4096 packets (≈5MB) means the
+/// link has been unable to drain for a long time — drop everything queued and
+/// let the receiver recover via PLI instead of growing without bound.
+const PACE_QUEUE_MAX: usize = 4096;
+
+async fn sample_sender<Track>(
+    track: Arc<Track>,
+    mut receiver: Receiver<Track::Sample>,
+    pace_bytes_per_sec: u64,
+) where
     Track: TrackLike,
 {
     // We do NOT send the PlayoutDelayExtension.
@@ -140,21 +167,100 @@ where
     // on cellular networks with 20ms+ latency jitter. Letting the browser manage its own jitter
     // buffer is essential for smooth real-time streaming over variable networks.
     let extensions = [];
-    while let Some(sample) = receiver.recv().await {
-        if let Err(err) = track
-            .write_with_extensions(
-                sample,
-                &extensions,
-            )
-            .await
-        {
-            warn!("[Stream]: track.write_sample failed: {err}");
+
+    // Token-bucket pacer. A normal frame fits inside the burst allowance and is
+    // sent immediately, exactly as before; only bursts well above the sustained
+    // rate (IDR/recovery frames, which can be 20+ packets back-to-back) get
+    // spread out, so they don't overflow the downlink queue and cause the
+    // loss → PLI → another IDR spiral on constrained links. Refill is based on
+    // measured elapsed time, so coarse OS timers only reduce smoothing
+    // granularity — never throughput.
+    let rate = pace_bytes_per_sec.max(1) as f64;
+    let burst_bytes = (rate * 0.005).max(24_000.0);
+    let mut budget = burst_bytes;
+    let mut last_refill = Instant::now();
+    let mut queue: VecDeque<Track::Sample> = VecDeque::new();
+    let mut open = true;
+
+    while open || !queue.is_empty() {
+        // Move everything already waiting in the channel into the local queue,
+        // so the (blocking) decode callback side never stalls on a full channel
+        // while we pace.
+        loop {
+            match receiver.try_recv() {
+                Ok(sample) => queue.push_back(sample),
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    open = false;
+                    break;
+                }
+            }
+        }
+
+        if queue.len() > PACE_QUEUE_MAX {
+            warn!(
+                "[Stream]: pacer queue exceeded {PACE_QUEUE_MAX} packets, dropping them (link too slow?)"
+            );
+            queue.clear();
+            continue;
+        }
+
+        if queue.is_empty() {
+            if !open {
+                break;
+            }
+            match receiver.recv().await {
+                Some(sample) => queue.push_back(sample),
+                None => open = false,
+            }
+            continue;
+        }
+
+        let now = Instant::now();
+        budget = (budget + now.duration_since(last_refill).as_secs_f64() * rate).min(burst_bytes);
+        last_refill = now;
+
+        if budget <= 0.0 {
+            // Out of budget: wait for a refill, but keep accepting packets so
+            // the sender side stays unblocked.
+            let deficit_secs = (-budget / rate).max(0.0005);
+            let sleep = tokio::time::sleep(Duration::from_secs_f64(deficit_secs));
+            tokio::pin!(sleep);
+            loop {
+                tokio::select! {
+                    _ = &mut sleep => break,
+                    received = receiver.recv(), if open => match received {
+                        Some(sample) => queue.push_back(sample),
+                        None => open = false,
+                    }
+                }
+            }
+            continue;
+        }
+
+        while budget > 0.0 {
+            let Some(sample) = queue.pop_front() else {
+                break;
+            };
+            budget -= Track::sample_size(&sample) as f64;
+            if let Err(err) = track
+                .write_with_extensions(
+                    sample,
+                    &extensions,
+                )
+                .await
+            {
+                warn!("[Stream]: track.write_sample failed: {err}");
+            }
         }
     }
 }
 
 pub trait TrackLike: Send + Sync + 'static {
     type Sample: Send + 'static;
+
+    /// Approximate wire size of a sample, used by the pacer's token bucket.
+    fn sample_size(sample: &Self::Sample) -> usize;
 
     fn write_with_extensions(
         &self,
@@ -167,6 +273,10 @@ pub trait TrackLike: Send + Sync + 'static {
 
 impl TrackLike for TrackLocalStaticSample {
     type Sample = Sample;
+
+    fn sample_size(sample: &Self::Sample) -> usize {
+        sample.data.len()
+    }
 
     async fn write_with_extensions(
         &self,
@@ -209,22 +319,19 @@ impl SequencedTrackLocalStaticRTP {
 impl TrackLike for SequencedTrackLocalStaticRTP {
     type Sample = rtp::packet::Packet;
 
+    fn sample_size(sample: &Self::Sample) -> usize {
+        // 12 bytes fixed RTP header + payload
+        12 + sample.payload.len()
+    }
+
     async fn write_with_extensions(
         &self,
         mut sample: Self::Sample,
         extensions: &[HeaderExtension],
     ) -> Result<(), anyhow::Error> {
-        let (any_paused, all_paused) = (
-            self.track.any_binding_paused().await,
-            self.track.all_binding_paused().await,
-        );
-
-        if all_paused {
+        if self.track.all_binding_paused().await {
             // Abort already here to not increment sequence numbers.
             return Ok(());
-        }
-        if any_paused {
-            // TODO: maybe warn?
         }
 
         sample.header.sequence_number = self.sequence_number.fetch_add(1, Ordering::Relaxed);
