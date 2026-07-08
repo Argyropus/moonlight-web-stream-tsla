@@ -168,26 +168,54 @@ export class StreamSettingsComponent implements Component {
         const presetRow = document.createElement("div")
         presetRow.style.cssText = "display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px;"
 
+        // jitterBufferMs is the stability-vs-latency knob for VIDEO only: it
+        // sets the WebRTC receiver's jitter buffer target. (It no longer
+        // affects audio — the playback worklet uses a single fixed prime
+        // depth regardless of preset; see its own comment.) Streaming wants a
+        // deep buffer (smooth like YouTube/Netflix, latency irrelevant);
+        // gaming wants it minimal.
         const presets: Array<{ label: string, desc: string, values: Partial<StreamSettings> }> = [
             {
                 label: "🎬 Video / Streaming",
-                desc: "1080p 30fps 3 Mbps — low bandwidth, smooth video playback",
-                values: { videoSize: "1080p", fps: 30, bitrate: 3000 }
+                desc: "1080p 30fps 3 Mbps, 150ms buffer — smooth playback over cellular",
+                values: { videoSize: "1080p", fps: 30, bitrate: 3000, jitterBufferMs: 150 }
             },
+            // Video render worker tradeoff (measured in the field): the worker
+            // reads frames on its own thread and delivers a metronomic 60Hz
+            // cadence (16.0-17.0ms gaps → visibly less micro-stutter), but its
+            // bitmaprenderer path goes through createImageBitmap + the normal
+            // compositor queue, adding ~1-2 vsyncs of latency. The main-thread
+            // path uses a desynchronized 2D canvas (can bypass compositing →
+            // lower input lag) at the cost of uneven frame pacing when the
+            // main thread is busy. So: Balanced = smoothness = worker ON,
+            // Performance = lowest input lag = worker OFF.
+            // Gaming bitrate is capped at 4 Mbps by the TESLA BROWSER's CPU
+            // budget, not the network: A/B-measured 2026-07-07, ~6.3 Mbps
+            // actual caused regular ~270ms whole-renderer stalls (freezes +
+            // audio underruns, all render paths, all resolutions — per-packet
+            // SRTP/depacketization cost, so resolution doesn't matter), while
+            // ~2.6 Mbps actual ran a full 5min session with ZERO freezes at
+            // 1080p60. Raise only with field evidence. For more quality per
+            // packet, enable the browser-codec toggle (H265 hardware decode).
+            //
+            // 60fps, not 120: requesting 120fps made the game render uncapped,
+            // saturating the host GPU (encoder collapsed to ~46fps with ragged
+            // pacing → freezes, PLI/IDR storms). 60fps maps 1:1 onto the
+            // Tesla's 60Hz display.
             {
                 label: "🎮 Gaming (Balanced)",
-                desc: "1080p 60fps 8 Mbps — good balance of quality and responsiveness",
-                values: { videoSize: "1080p", fps: 60, bitrate: 8000 }
+                desc: "1080p 60fps 4 Mbps, 40ms buffer, direct render — smooth pacing, good responsiveness",
+                values: { videoSize: "1080p", fps: 60, bitrate: 4000, jitterBufferMs: 40, useVideoWorker: false }
             },
             {
                 label: "🎮 Gaming (Performance)",
-                desc: "1080p 120fps 12 Mbps — maximum responsiveness",
-                values: { videoSize: "1080p", fps: 120, bitrate: 12000 }
+                desc: "1080p 60fps 8 Mbps, no buffer, direct render — lowest input lag",
+                values: { videoSize: "1080p", fps: 60, bitrate: 8000, jitterBufferMs: 0, useVideoWorker: false }
             },
             {
                 label: "📱 Low Bandwidth",
-                desc: "720p 30fps 1.5 Mbps — minimal data usage",
-                values: { videoSize: "720p", fps: 30, bitrate: 1500 }
+                desc: "720p 30fps 1.5 Mbps, 100ms buffer — minimal data usage",
+                values: { videoSize: "720p", fps: 30, bitrate: 1500, jitterBufferMs: 100 }
             },
         ]
 

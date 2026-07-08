@@ -62,8 +62,13 @@ export function getStandardVideoFormats() {
 export async function getSupportedVideoFormats(): Promise<VideoCodecSupport> {
     let support: VideoCodecSupport = getStandardVideoFormats()
 
-    let capabilities = RTCRtpReceiver.getCapabilities("video")
-    if ("getCapabilities" in RTCRtpReceiver && typeof RTCRtpReceiver.getCapabilities == "function" && (capabilities = RTCRtpReceiver.getCapabilities("video"))) {
+    // Guard before touching RTCRtpReceiver: evaluating getCapabilities()
+    // unconditionally would throw on browsers without it and skip every
+    // fallback detection path below.
+    let capabilities: RTCRtpCapabilities | null = null
+    if (typeof RTCRtpReceiver !== "undefined"
+        && typeof RTCRtpReceiver.getCapabilities === "function"
+        && (capabilities = RTCRtpReceiver.getCapabilities("video"))) {
         for (const capCodec of capabilities.codecs) {
             for (const codec of CAPABILITIES_CODECS) {
                 let compatible = true

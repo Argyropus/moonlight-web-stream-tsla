@@ -23,13 +23,28 @@ class PcmPlaybackProcessor extends AudioWorkletProcessor {
         this.framesWritten = 0;
         this.lastStatsAt = 0;
         this.drops = 0;
-        // Latency control thresholds (in samples at 48kHz):
-        // Target: 120ms = 5760 samples (initial buffer — absorbs network jitter)
-        // Soft overrun: 200ms = 9600 samples → speed up playback
-        // Hard overrun: 350ms = 16800 samples → skip ahead
-        this.targetSamples = 5760;
-        this.softOverrunSamples = 9600;
-        this.hardOverrunSamples = 16800;
+        // Latency control thresholds (in samples at 48kHz). Fixed and NOT
+        // tied to any per-preset setting — user has explicitly said A/V sync
+        // doesn't matter, only avoiding stutter/underrun does, so there's no
+        // reason to trade buffer depth for latency here.
+        //
+        // Prime: buffer this much before EVERY (re)start of playback — both
+        // the very first fill and every recovery after a mid-stream underrun
+        // use the SAME depth. An earlier version used a much shallower
+        // re-prime (~20ms) for mid-stream recovery to avoid a long mute on
+        // every underrun, but that meant the deep buffer only ever helped
+        // once per session: after the first underrun (which happens early),
+        // every later recovery re-armed to only ~20ms — far too thin to
+        // survive the Tesla's documented 100-300ms stalls, so underruns kept
+        // recurring for the rest of the session. Always re-priming to the
+        // same deep target trades a longer mute per underrun for underruns
+        // becoming rare in the first place.
+        this.primeSamples = 7200;        // 150ms
+        this.targetSamples = 7200;       // 150ms — level to skip back to on hard overrun
+        this.softOverrunSamples = 9600;  // 200ms — above this, speed up slightly
+        this.hardOverrunSamples = 16800; // 350ms — above this, skip ahead
+        // True while refilling to primeSamples (at startup and after underrun).
+        this.priming = true;
         // Direct PCM port from decode worker (bypasses main thread entirely)
         this.pcmPort = null;
 
@@ -93,9 +108,22 @@ class PcmPlaybackProcessor extends AudioWorkletProcessor {
         const available = (this.writePos - this.readPos + this.ringSize) % this.ringSize;
 
         if (available === 0) {
-            // Buffer empty — output silence
-            this.underruns++;
+            // Buffer empty — output silence and refill to the prime level
+            // before resuming, so we don't crackle along at a near-empty
+            // buffer where every network wobble is a fresh underrun.
+            if (!this.priming) {
+                this.underruns++;
+                this.priming = true;
+            }
             return true;
+        }
+
+        if (this.priming) {
+            if (available < this.primeSamples) {
+                // Still refilling — keep outputting silence.
+                return true;
+            }
+            this.priming = false;
         }
 
         // --- Latency control (mirrors original AudioBufferSourceNode logic) ---
@@ -113,28 +141,24 @@ class PcmPlaybackProcessor extends AudioWorkletProcessor {
             return true;
         }
 
-        // Soft overrun: buffer 150-300ms → read slightly more than needed (catch-up).
-        // Equivalent to original's playbackRate 1.0-1.06.
-        // We read extra samples and discard them (inaudible at 1-4 extra per 128).
-        let toRead = Math.min(needed, available);
+        // Soft overrun: buffer above soft threshold → skip 1-4 extra samples per
+        // 128-sample quantum (inaudible), gradually draining excess latency.
+        // Equivalent to a playbackRate of 1.0-1.03.
         if (available > this.softOverrunSamples) {
-            // Scale extra read: 0→4 samples between softOverrun and hardOverrun
+            // Scale extra skip: 0→4 samples between softOverrun and hardOverrun
             const t = Math.min(1, (available - this.softOverrunSamples) / (this.hardOverrunSamples - this.softOverrunSamples));
             const extra = Math.round(4 * t);
-            const catchupRead = Math.min(needed + extra, available);
-            // Read catchupRead samples but only output 'needed' of them
-            // (effectively speeds up playback by skipping 'extra' samples)
             this._readFromRing(outL, outR, needed, needed);
-            // Skip the extra samples
-            if (extra > 0 && available > needed + extra) {
-                this.readPos = (this.readPos + extra) % this.ringSize;
+            const skip = Math.min(extra, available - needed);
+            if (skip > 0) {
+                this.readPos = (this.readPos + skip) % this.ringSize;
             }
             this._maybeStats();
             return true;
         }
 
         // Normal: read exactly what's needed
-        this._readFromRing(outL, outR, toRead, needed);
+        this._readFromRing(outL, outR, Math.min(needed, available), needed);
         this._maybeStats();
         return true;
     }

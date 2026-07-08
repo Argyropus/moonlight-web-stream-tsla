@@ -207,12 +207,7 @@ impl VideoDecoder for TrackSampleVideoDecoder {
         } else {
             // No pre-registered sender (should not happen in normal flow).
             self.sender.blocking_create_track(
-                TrackLocalStaticRTP::new(
-                    codec.capability.clone(),
-                    "video".to_string(),
-                    "moonlight".to_string(),
-                )
-                .into(),
+                SequencedTrackLocalStaticRTP::from_arc(video_track),
                 move |packet| {
                     let packet = packet.as_any();
                     if packet.is::<PictureLossIndication>() {
@@ -343,9 +338,11 @@ impl VideoDecoder for TrackSampleVideoDecoder {
 
         self.old_presentation_time = unit.presentation_time;
 
+        // Strong compare_exchange: the weak variant can fail spuriously, which
+        // would delay a PLI-triggered IDR request by a whole frame.
         if self
             .needs_idr
-            .compare_exchange_weak(true, false, Ordering::SeqCst, Ordering::Relaxed)
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::Relaxed)
             .is_ok()
         {
             return DecodeResult::NeedIdr;

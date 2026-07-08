@@ -302,6 +302,7 @@ export class Stream {
                     } else if (this.audioFallbackReady) {
                         this.audioDecodeWorker?.postMessage({ type: "use-main-thread" } as AudioDecodeWorkerInMessage);
                     }
+                    this.flushPreReadyAudioPackets()
                     return
                 }
 
@@ -370,6 +371,7 @@ export class Stream {
             this.audioDecoderReady = true;
             this.useAudioDecodeWorker = false
             this.debugLog("Opus decoder ready (main thread)");
+            this.flushPreReadyAudioPackets()
         } catch (e) {
             console.error("Failed to setup opus decoder", e);
             this.debugLog(`Failed to setup opus decoder: ${e}`);
@@ -431,6 +433,12 @@ export class Stream {
                 });
                 this.audioWorkletNode.connect(this.mainGainNode!);
                 this.audioWorkletReady = true;
+
+                // No prime-depth config sent — the worklet uses a single
+                // fixed prime depth for both the initial fill and every
+                // recovery after a mid-stream underrun (see its own comment).
+                // Not tied to jitterBufferMs: audio/video sync doesn't matter
+                // here, only avoiding stutter/underrun does.
 
                 // Listen for stats from worklet
                 this.audioWorkletNode.port.onmessage = (event: MessageEvent) => {
@@ -618,6 +626,16 @@ export class Stream {
     private sendDebugLogToServer() {
         if (this.debugLogBuffer.length === 0) return
         const log = this.debugLogBuffer.join("\n")
+        this.sendWsMessage({ ClientLog: { log } })
+    }
+
+    /**
+     * Sends an arbitrary text blob to the server as a ClientLog message, which
+     * the web-server process logs directly to its own console (see
+     * `relay_ws_to_ipc` in api/stream.rs) — lets stats be inspected without
+     * opening devtools on the client (e.g. the Tesla browser).
+     */
+    sendClientLogMessage(log: string) {
         this.sendWsMessage({ ClientLog: { log } })
     }
 
@@ -1041,8 +1059,20 @@ export class Stream {
         }
     }
 
+    // Packets that arrived before the decoder finished initializing. The very
+    // first DataChannel messages carry the Ogg-Opus headers (OpusHead/OpusTags)
+    // that the WASM decoder needs to bootstrap — dropping them would leave the
+    // stream permanently silent on the WASM path.
+    private preReadyAudioPackets: ArrayBuffer[] = []
+    private readonly PRE_READY_AUDIO_MAX = 256
+
     private onAudioDataChannelMessage(event: MessageEvent) {
-        if (!this.audioDecoderReady) return;
+        if (!this.audioDecoderReady) {
+            if (this.preReadyAudioPackets.length < this.PRE_READY_AUDIO_MAX) {
+                this.preReadyAudioPackets.push(event.data as ArrayBuffer);
+            }
+            return;
+        }
         this.audioPacketsReceived++;
 
         // Ensure AudioContext is running (autoplay policy / browser interruption)
@@ -1068,6 +1098,10 @@ export class Stream {
             if (now > 0) this.lastAudioPacketAt = now;
         }
 
+        this.dispatchAudioPacket(packet);
+    }
+
+    private dispatchAudioPacket(packet: ArrayBuffer) {
         // Worker path: zero-copy transfer directly from the event callback.
         // No queue, no intermediate arrays, no setTimeout — just hand the buffer
         // to the worker thread instantly. This keeps the callback allocation-free.
@@ -1089,6 +1123,15 @@ export class Stream {
         if (!this.audioDrainScheduled) {
             this.audioDrainScheduled = true;
             this.drainAudioQueue();
+        }
+    }
+
+    /** Feed packets that arrived before the decoder was ready, in arrival order. */
+    private flushPreReadyAudioPackets() {
+        for (const packet of this.preReadyAudioPackets.splice(0)) {
+            this.audioPacketsReceived++;
+            this.audioBytesReceived += packet.byteLength;
+            this.dispatchAudioPacket(packet);
         }
     }
 

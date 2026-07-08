@@ -1,4 +1,5 @@
 import { Stream, StreamAudioDiagnostics } from "../stream/index.js"
+import { InputDiagnostics } from "../stream/input.js"
 import { Component } from "./index.js"
 
 type WorkerDiagnosticsSnapshot = {
@@ -31,10 +32,21 @@ type WorkerDiagnosticsSnapshot = {
 export class StreamStatsOverlay implements Component {
     private root = document.createElement("div")
     private intervalId: ReturnType<typeof setInterval> | null = null
+    private reportIntervalId: ReturnType<typeof setInterval> | null = null
     private peerGetter: (() => RTCPeerConnection | null) | null = null
     private streamGetter: (() => Stream | null) | null = null
     private workerDiagnosticsGetter: (() => WorkerDiagnosticsSnapshot | null) | null = null
+    private inputDiagnosticsGetter: (() => InputDiagnostics | null) | null = null
     private statsEnabledCallback: ((enabled: boolean) => void) | null = null
+    private statsReportCallback: ((text: string) => void) | null = null
+    // How often to push the full stats dump to the server's console while the
+    // overlay is open — independent of the 2s on-screen refresh rate.
+    private static readonly REPORT_INTERVAL_MS = 5 * 60 * 1000
+
+    // [label, element] pairs, in display order — reused to build the full
+    // text dump sent to the server, so that list only needs to be maintained
+    // in one place.
+    private statRows: Array<[string, HTMLSpanElement]> = []
 
     // Cached DOM elements for fast updates (avoid querySelector each tick)
     private elVideoRes = document.createElement("span")
@@ -50,6 +62,7 @@ export class StreamStatsOverlay implements Component {
     private elFreeze = document.createElement("span")
     private elFreezeDetail = document.createElement("span")
     private elAssembly = document.createElement("span")
+    private elInput = document.createElement("span")
     private elAudioBitrate = document.createElement("span")
     private elAudioPackets = document.createElement("span")
     private elAudioGap = document.createElement("span")
@@ -76,10 +89,13 @@ export class StreamStatsOverlay implements Component {
     private prevFramesAssembled = 0
     private prevJitterBufferDelay = 0
     private prevJitterBufferEmittedCount = 0
+    private prevJitterBufferMinimumDelay = 0
     private prevCanvasArrivedCount = 0
     private prevFreezeCount = 0
     private freezeCorrelationJitterSpikes = 0  // freezes that coincided with jitter spike
     private freezeCorrelationReceiveDrop = 0   // freezes that coincided with frame receive rate drop
+    private freezeCorrelationSlowGpPoll = 0    // freezes that coincided with a slow (>20ms) getGamepads() call
+    private prevInputEventsSent = 0
     private prevAvgJbDelayMs = 0  // rolling avg jitter buffer delay for spike detection
     private rollingFrameRateReceived = 0  // EMA of frames received per second
 
@@ -118,6 +134,7 @@ export class StreamStatsOverlay implements Component {
             ["Freeze", this.elFreeze],
             ["Freeze Detail", this.elFreezeDetail],
             ["Frame Assembly", this.elAssembly],
+            ["Input", this.elInput],
             ["Audio Bitrate", this.elAudioBitrate],
             ["Audio Messages", this.elAudioPackets],
             ["Audio Gap", this.elAudioGap],
@@ -143,6 +160,8 @@ export class StreamStatsOverlay implements Component {
             row.appendChild(valueEl)
             this.root.appendChild(row)
         }
+
+        this.statRows = rows
     }
 
     setPeerGetter(getter: () => RTCPeerConnection | null) {
@@ -157,8 +176,17 @@ export class StreamStatsOverlay implements Component {
         this.workerDiagnosticsGetter = getter
     }
 
+    setInputDiagnosticsGetter(getter: () => InputDiagnostics | null) {
+        this.inputDiagnosticsGetter = getter
+    }
+
     setStatsEnabledCallback(cb: (enabled: boolean) => void) {
         this.statsEnabledCallback = cb
+    }
+
+    /** Called every REPORT_INTERVAL_MS while the overlay is visible, with a full text dump of the current stats. */
+    setStatsReportCallback(cb: (text: string) => void) {
+        this.statsReportCallback = cb
     }
 
     show() {
@@ -169,6 +197,11 @@ export class StreamStatsOverlay implements Component {
         if (!this.intervalId) {
             this.intervalId = setInterval(() => this.scheduleUpdate(), 2000)
         }
+        // Periodically push the full stats dump to the server's console, so
+        // it can be inspected without opening devtools on the client.
+        if (!this.reportIntervalId) {
+            this.reportIntervalId = setInterval(() => this.reportStats(), StreamStatsOverlay.REPORT_INTERVAL_MS)
+        }
     }
 
     hide() {
@@ -178,6 +211,17 @@ export class StreamStatsOverlay implements Component {
             clearInterval(this.intervalId)
             this.intervalId = null
         }
+        if (this.reportIntervalId) {
+            clearInterval(this.reportIntervalId)
+            this.reportIntervalId = null
+        }
+    }
+
+    /** Builds a plaintext dump of every currently-displayed stat and hands it to the report callback, if any. */
+    private reportStats() {
+        if (!this.statsReportCallback) return
+        const lines = this.statRows.map(([label, valueEl]) => `${label}: ${valueEl.textContent}`)
+        this.statsReportCallback(`[Stream Stats]\n${lines.join("\n")}`)
     }
 
     isVisible(): boolean {
@@ -327,6 +371,20 @@ export class StreamStatsOverlay implements Component {
             ? `${freezeCount} events, ${(totalFreezesDuration * 1000).toFixed(0)} ms total`
             : `0`
 
+        // Input activity + gamepad poll timing for this interval. Fetched here
+        // (before the freeze block) so freezes can be correlated with slow
+        // navigator.getGamepads() calls — Tesla's BT HID stack is a suspected
+        // renderer-stall source.
+        const inputDiag = this.inputDiagnosticsGetter?.() ?? null
+        if (inputDiag) {
+            const eventsDelta = inputDiag.eventsSent - this.prevInputEventsSent
+            this.prevInputEventsSent = inputDiag.eventsSent
+            const eventsRate = elapsed > 0 ? Math.round(eventsDelta / elapsed) : 0
+            this.elInput.textContent =
+                `${eventsRate}/s sent, gp poll max ${inputDiag.gamepadPollIntervalMaxMs.toFixed(1)} ms` +
+                ` (worst ${inputDiag.gamepadPollSessionMaxMs.toFixed(1)} ms, >20ms: ${inputDiag.gamepadPollSlowCount})`
+        }
+
         // Freeze cause correlation: detect if freezes coincide with jitter buffer spikes
         // A "jitter spike" means the avg jitter buffer delay this interval is >2× the rolling avg.
         const jbDelayDeltaForFreeze   = jitterBufferDelay        - this.prevJitterBufferDelay
@@ -351,6 +409,9 @@ export class StreamStatsOverlay implements Component {
             if (receiveRateDropped) {
                 this.freezeCorrelationReceiveDrop += freezeDelta
             }
+            if (inputDiag && inputDiag.gamepadPollIntervalMaxMs > 20) {
+                this.freezeCorrelationSlowGpPoll += freezeDelta
+            }
         }
         this.prevFreezeCount = freezeCount
         // Update rolling average (EMA with α=0.2)
@@ -370,7 +431,7 @@ export class StreamStatsOverlay implements Component {
             else freezeCause = "browser decode/render stall"
         }
         this.elFreezeDetail.textContent = freezeCount > 0
-            ? `avg ${avgFreezeDurationMs} ms, cause: ${freezeCause} | jitter: ${this.freezeCorrelationJitterSpikes}/${freezeCount}, rx-drop: ${this.freezeCorrelationReceiveDrop}/${freezeCount}`
+            ? `avg ${avgFreezeDurationMs} ms, cause: ${freezeCause} | jitter: ${this.freezeCorrelationJitterSpikes}/${freezeCount}, rx-drop: ${this.freezeCorrelationReceiveDrop}/${freezeCount}, gp-poll: ${this.freezeCorrelationSlowGpPoll}/${freezeCount}`
             : `—`
 
         this.elVideoRes.textContent = videoWidth > 0 ? `${videoWidth}×${videoHeight}` : "—"
@@ -382,12 +443,21 @@ export class StreamStatsOverlay implements Component {
 
         // Jitter buffer delay: avg time each frame waited in the buffer before reaching the decoder.
         // This is the definitive measure of end-to-end decode latency budget consumed by the jitter buffer.
+        // Both jitterBufferDelay and jitterBufferMinimumDelay are CUMULATIVE
+        // sums over all emitted frames (W3C webrtc-stats), so each must be
+        // divided by the emitted-count delta. Per spec, the "minimum" variant
+        // purposefully IGNORES jitterBufferTarget: it is the delay the buffer
+        // could achieve from network conditions alone. So `avg` is what frames
+        // really waited (\u2248 the jitterBufferMs setting once ramped), `floor` is
+        // the network minimum, and avg \u2212 floor = latency deliberately spent on
+        // smoothing.
         const jbDelayDelta   = jitterBufferDelay        - this.prevJitterBufferDelay
         const jbEmittedDelta = jitterBufferEmittedCount - this.prevJitterBufferEmittedCount
+        const jbMinDelta     = jitterBufferMinimumDelay - this.prevJitterBufferMinimumDelay
         const avgJbDelayMs   = jbEmittedDelta > 0 ? (jbDelayDelta / jbEmittedDelta * 1000) : -1
-        const jbMinMs        = jitterBufferMinimumDelay > 0 ? (jitterBufferMinimumDelay * 1000).toFixed(1) : "?"
+        const floorJbMs      = jbEmittedDelta > 0 ? (jbMinDelta / jbEmittedDelta * 1000) : -1
         this.elJitter.textContent = jitter > 0
-            ? `net ${(jitter * 1000).toFixed(1)} ms, buf avg ${avgJbDelayMs >= 0 ? avgJbDelayMs.toFixed(1) : "?"} ms (min ${jbMinMs} ms)`
+            ? `net ${(jitter * 1000).toFixed(1)} ms, buf avg ${avgJbDelayMs >= 0 ? avgJbDelayMs.toFixed(1) : "?"} ms (floor ${floorJbMs >= 0 ? floorJbMs.toFixed(1) : "?"} ms)`
             : "\u2014"
 
         const stream = this.streamGetter?.()
@@ -423,8 +493,17 @@ export class StreamStatsOverlay implements Component {
                     const srcGapStr = (c as any).srcGapMs ? `, src: ${(c as any).srcGapMs} ms` : ""
                     const supersededStr = c.supersededCount > 0 ? `, skip=${c.supersededCount}` : ""
                     const jumpsStr = c.jumpCount > 0 ? `, jumps=${c.jumpCount}` : ""
-                    const arrivedRate = elapsed > 0 ? Math.round((c.arrivedCount - this.prevCanvasArrivedCount) / elapsed) : 0
-                    this.prevCanvasArrivedCount = c.arrivedCount
+                    // Worker mode: `arrivedCount` is an interval count over the
+                    // worker's fixed 2s reporting window (it resets every post),
+                    // so the rate is simply count/2 — diffing it like the
+                    // cumulative main-thread counter yields garbage (~1/s).
+                    let arrivedRate: number
+                    if (c.active) {
+                        arrivedRate = Math.round(c.arrivedCount / 2)
+                    } else {
+                        arrivedRate = elapsed > 0 ? Math.round((c.arrivedCount - this.prevCanvasArrivedCount) / elapsed) : 0
+                        this.prevCanvasArrivedCount = c.arrivedCount
+                    }
                     this.elWorkerVideo.textContent = `mode=${modeLabel}, arrived=${arrivedRate}/s, drawn=${c.drawnFrameCount}, ${dropLabel}=${c.rafMissedFrames}${supersededStr}${jumpsStr}${gapStr}${srcGapStr}, err=${c.error ?? "none"}`
                 } else {
                     this.elWorkerVideo.textContent = "canvas diagnostics unavailable"
@@ -453,6 +532,7 @@ export class StreamStatsOverlay implements Component {
         this.prevFramesAssembled = framesAssembledFromMultiplePackets
         this.prevJitterBufferDelay = jitterBufferDelay
         this.prevJitterBufferEmittedCount = jitterBufferEmittedCount
+        this.prevJitterBufferMinimumDelay = jitterBufferMinimumDelay
     }
 
     destroy() {
@@ -460,6 +540,7 @@ export class StreamStatsOverlay implements Component {
         this.peerGetter = null
         this.streamGetter = null
         this.workerDiagnosticsGetter = null
+        this.statsReportCallback = null
     }
 
     mount(parent: HTMLElement): void {

@@ -168,14 +168,18 @@ impl Payloader for H264Payloader {
         if let (Some(pps), Some(sps)) = (self.pps_nalu.as_ref(), self.sps_nalu.as_ref()) {
             let stap_a = Self::build_stap_a_packet(&[sps, pps]);
 
-            if stap_a.len() >= mtu {
-                return Ok(vec![]);
+            if stap_a.len() < mtu {
+                packets.push(stap_a.freeze());
+            } else {
+                // Aggregate too large (pathological parameter sets): send them
+                // as single NALs instead. Returning early here would silently
+                // drop the *current* NAL (possibly an IDR slice) with them.
+                packets.push(Self::build_single_nal(sps.clone()));
+                packets.push(Self::build_single_nal(pps.clone()));
             }
 
             self.pps_nalu.take();
             self.sps_nalu.take();
-
-            packets.push(stap_a.freeze());
         }
 
         if b.len() <= mtu {

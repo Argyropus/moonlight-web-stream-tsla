@@ -1,4 +1,4 @@
-use std::{collections::HashMap, panic, process::exit, str::FromStr, sync::Arc};
+use std::{collections::HashMap, panic, process::exit, str::FromStr, sync::Arc, time::Duration};
 
 use common::{
     StreamSettings,
@@ -114,7 +114,7 @@ async fn main() {
 
     let (
         server_config,
-        stream_settings,
+        mut stream_settings,
         host_address,
         host_http_port,
         host_unique_id,
@@ -173,6 +173,17 @@ async fn main() {
     let host_address = match try_localhost(host_http_port).await {
         Some(local) => {
             info!("[Stream] Using local address {local} instead of {host_address}");
+            // Loopback has no path-MTU concern, so use the standard Moonlight
+            // LAN packet size: fewer, larger packets from Sunshine means less
+            // per-packet/FEC overhead. The WebRTC side repacketizes to its own
+            // MTU anyway, so this never affects what goes over the real network.
+            if stream_settings.packet_size < 1392 {
+                info!(
+                    "[Stream] Raising packet size {} -> 1392 for loopback host connection",
+                    stream_settings.packet_size
+                );
+                stream_settings.packet_size = 1392;
+            }
             local
         }
         None => host_address,
@@ -207,6 +218,28 @@ async fn main() {
         ..Default::default()
     };
     let mut api_settings = SettingEngine::default();
+
+    // Faster failure detection for cellular clients. Defaults are 5s to
+    // "disconnected" and a further 25s to "failed" — meaning our ICE-restart
+    // recovery didn't even start until ~30s after the link died (observed in
+    // the field: a cellular network switch caused 37s of dead air, and the
+    // client gave up and reconnected from scratch before the restart fired).
+    // 4s/8s starts the restart ~12s after real connectivity loss, while brief
+    // cellular stalls that recover within the window are unaffected (state
+    // just flips back to connected on the next successful check).
+    api_settings.set_ice_timeouts(
+        Some(Duration::from_secs(4)),  // disconnected
+        Some(Duration::from_secs(8)),  // failed (measured after disconnected)
+        Some(Duration::from_secs(2)),  // keepalive interval
+    );
+
+    // Don't run an mDNS resolver at all. Browser-side .local host candidates
+    // are unusable to us anyway (mDNS resolution in webrtc-rs can stall the
+    // whole candidate-pair pipeline — the reason inject_non_mdns_candidates()
+    // exists), and real connectivity always comes from the injected srflx/host
+    // candidates or peer-reflexive discovery. This also removes the stray
+    // 0.0.0.0:5353 listener the streamer had no use for.
+    api_settings.set_ice_multicast_dns_mode(webrtc::ice::mdns::MulticastDnsMode::Disabled);
 
     if let Some(PortRange { min, max }) = server_config.webrtc_port_range {
         match EphemeralUDP::new(min, max) {
@@ -416,11 +449,18 @@ impl StreamConnection {
         let input = StreamInput::new();
 
         let general_channel = peer.create_data_channel("general", None).await?;
+        // Ordered but unreliable (max_retransmits: 0): the client parses this
+        // as one continuous Ogg byte stream, so messages must arrive in order.
+        // With SCTP partial reliability a lost message is abandoned (FORWARD-TSN)
+        // instead of retransmitted, so ordering costs at most ~1 RTT of stall on
+        // actual loss — while unordered delivery would hand the Ogg demuxer
+        // reordered pages and garble audio on exactly the cellular links this
+        // stream targets.
         let audio_channel = peer
             .create_data_channel(
                 "audio",
                 Some(RTCDataChannelInit {
-                    ordered: Some(false),
+                    ordered: Some(true),
                     max_packet_life_time: None,
                     max_retransmits: Some(0),
                     ..Default::default()

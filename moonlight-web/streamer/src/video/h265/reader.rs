@@ -203,7 +203,8 @@ mod tests {
 
     #[test]
     fn test_parse_forbidden_zero_bit() {
-        let header_bytes = [0b00000001, 0b00000000]; // forbidden_zero_bit = 1
+        // forbidden_zero_bit is the MSB of the first header byte (H.265 7.3.1.2)
+        let header_bytes = [0b10000000, 0b00000000]; // forbidden_zero_bit = 1
         let nal = NalHeader::parse(header_bytes);
         assert!(nal.forbidden_zero_bit);
 
@@ -223,12 +224,13 @@ mod tests {
 
     #[test]
     fn test_parse_layer_id_and_tid() {
+        // Per H.265 7.3.1.2: nuh_layer_id is 6 bits spanning the last bit of
+        // byte 0 and the top 5 bits of byte 1; TID is the low 3 bits of byte 1.
         let header_bytes = [0b10000010, 0b10101100];
         let nal = NalHeader::parse(header_bytes);
-        // nuh_layer_id = (header[0] >> 7) | ((header[1] & 0b00011111) << 1)
-        let expected_layer_id = (header_bytes[0] >> 7) | ((header_bytes[1] & 0b00011111) << 1);
+        let expected_layer_id = ((header_bytes[0] & 0b00000001) << 5) | (header_bytes[1] >> 3);
         assert_eq!(nal.nuh_layer_id, expected_layer_id);
-        let expected_tid = (header_bytes[1] >> 5) & 0b00000111;
+        let expected_tid = header_bytes[1] & 0b00000111;
         assert_eq!(nal.nuh_temporal_id_plus1, expected_tid);
     }
 

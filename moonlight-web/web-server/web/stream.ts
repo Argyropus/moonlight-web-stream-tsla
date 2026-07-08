@@ -105,7 +105,6 @@ class ViewerApp implements Component {
     private pollRafId: number | null = null
     private pollTimerId: ReturnType<typeof setTimeout> | null = null
     private pollLoopRunning: boolean = false
-    private gamepadPollToggle: boolean = false  // poll gamepads at 30Hz (every other frame)
 
     constructor(api: Api, hostId: number, appId: number) {
         this.api = api
@@ -222,9 +221,16 @@ class ViewerApp implements Component {
         this.statsOverlay.setPeerGetter(() => this.stream?.getPeer() ?? null)
         this.statsOverlay.setStreamGetter(() => this.stream)
         this.statsOverlay.setWorkerDiagnosticsGetter(() => this.getWorkerDiagnostics())
+        this.statsOverlay.setInputDiagnosticsGetter(() => this.stream?.getInput().getInputDiagnostics() ?? null)
         this.statsOverlay.setStatsEnabledCallback((enabled) => {
             this.stream?.setStatsEnabled(enabled)
             this.canvasRenderer?.setStatsEnabled(enabled)
+        })
+        // Every 5 minutes while the stats overlay is open, log the full stats
+        // dump to the server's console (visible without opening devtools —
+        // useful since the Tesla browser has none).
+        this.statsOverlay.setStatsReportCallback((text) => {
+            this.stream?.sendClientLogMessage(text)
         })
         if (settings.showStreamStats) {
             this.statsOverlay.show()
@@ -513,11 +519,18 @@ class ViewerApp implements Component {
                 this.onTouchUpdate()
             }
 
-            // Poll gamepads at 30Hz (every other rAF). navigator.getGamepads()
-            // is expensive on Tesla (~100μs+ per call due to object allocation).
-            // 33ms input latency is imperceptible for controller input.
-            this.gamepadPollToggle = !this.gamepadPollToggle
-            if (this.gamepadPollToggle && input.hasGamepads()) {
+            // Poll gamepads every rAF (full 60Hz). Previously throttled to
+            // 30Hz on the assumption that navigator.getGamepads() was
+            // expensive (~100μs+) on Tesla — but field instrumentation
+            // (2026-07-07) measured actual call times of ~0.2ms typical,
+            // <2.5ms worst case even during active play, with zero
+            // correlation to the freezes we were chasing (which turned out to
+            // be a bitrate/CPU-budget issue, unrelated to input polling — see
+            // gaming preset bitrate cap). That's negligible within a 16.6ms
+            // frame budget, so there's no reason to leave latency on the
+            // table: this halves worst-case gamepad input latency from ~33ms
+            // to ~16ms.
+            if (input.hasGamepads()) {
                 this.onGamepadUpdate()
             }
 

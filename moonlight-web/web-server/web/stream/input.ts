@@ -20,6 +20,10 @@ const TOUCHES_AS_KEYBOARD_DISTANCE = 100
 // When a virtual and physical controller connect within this many ms, prefer the physical and skip the virtual in auto mode
 const VIRTUAL_SUPPRESSION_MS = 200
 
+// Total input messages actually handed to a DataChannel (all types). Used by
+// the stats overlay to correlate freezes with input activity on the Tesla.
+let sentInputEventCount = 0
+
 function trySendChannel(channel: RTCDataChannel | null, buffer: ByteBuffer) {
     if (!channel || channel.readyState != "open") {
         return
@@ -31,6 +35,18 @@ function trySendChannel(channel: RTCDataChannel | null, buffer: ByteBuffer) {
         throw "illegal buffer size"
     }
     channel.send(readView)
+    sentInputEventCount++
+}
+
+export type InputDiagnostics = {
+    /** Cumulative input messages sent over DataChannels. */
+    eventsSent: number
+    /** Max navigator.getGamepads() duration since the previous read (ms). */
+    gamepadPollIntervalMaxMs: number
+    /** Max navigator.getGamepads() duration for the whole session (ms). */
+    gamepadPollSessionMaxMs: number
+    /** Cumulative count of getGamepads() calls that took >20ms. */
+    gamepadPollSlowCount: number
 }
 
 export type MouseScrollMode = "highres" | "normal"
@@ -88,6 +104,36 @@ export class StreamInput {
     private debugLogs: Array<{ time: number; message: string }> = []
     private maxDebugLogs = 100
 
+    // getGamepads() timing — Tesla's Bluetooth HID stack is a known source of
+    // main-thread stalls (rumble was disabled for the same reason), so measure
+    // whether the 30Hz poll itself is what stalls the renderer during play.
+    private gamepadPollIntervalMaxMs = 0
+    private gamepadPollSessionMaxMs = 0
+    private gamepadPollSlowCount = 0
+
+    /** Timed wrapper around navigator.getGamepads() for the hot poll path. */
+    private timedGetGamepads(): (Gamepad | null)[] {
+        const start = performance.now()
+        const gamepads = navigator.getGamepads()
+        const tookMs = performance.now() - start
+        if (tookMs > this.gamepadPollIntervalMaxMs) this.gamepadPollIntervalMaxMs = tookMs
+        if (tookMs > this.gamepadPollSessionMaxMs) this.gamepadPollSessionMaxMs = tookMs
+        if (tookMs > 20) this.gamepadPollSlowCount++
+        return gamepads
+    }
+
+    /** Stats snapshot; resets the per-interval poll max on each read. */
+    getInputDiagnostics(): InputDiagnostics {
+        const diag: InputDiagnostics = {
+            eventsSent: sentInputEventCount,
+            gamepadPollIntervalMaxMs: this.gamepadPollIntervalMaxMs,
+            gamepadPollSessionMaxMs: this.gamepadPollSessionMaxMs,
+            gamepadPollSlowCount: this.gamepadPollSlowCount,
+        }
+        this.gamepadPollIntervalMaxMs = 0
+        return diag
+    }
+
     constructor(config?: StreamInputConfig, peer?: RTCPeerConnection,) {
         if (peer) {
             this.setPeer(peer)
@@ -115,12 +161,24 @@ export class StreamInput {
 
         this.keyboard = peer.createDataChannel("keyboard")
 
-        this.mouseClicks = peer.createDataChannel("mouseClicks", {
-            ordered: false
-        })
+        // IMPORTANT: no client→streamer channel may use partial reliability
+        // (maxRetransmits/maxPacketLifeTime). Abandoning a message makes Chrome
+        // send an SCTP FORWARD-TSN chunk, and webrtc-rs (≤0.14) has a parser
+        // bug (chunk_forward_tsn.rs computes `remaining` from the END OF THE
+        // PACKET instead of the chunk boundary): any FORWARD-TSN *bundled*
+        // with other chunks fails with "chunk too short" and the streamer
+        // DROPS THE WHOLE PACKET — including bundled input DATA and SACKs.
+        // Under cellular uplink loss this snowballs into a retransmit storm
+        // that makes input fully unresponsive (observed in the field).
+        // Reliable channels never abandon → never emit FORWARD-TSN.
+        //
+        // mouseClicks: ordered — press/release pairs must not reorder.
+        this.mouseClicks = peer.createDataChannel("mouseClicks")
+        // Unordered but reliable: a late absolute position is overwritten by
+        // the next one, and relative deltas commute — order doesn't matter,
+        // but every delta must arrive or the cursor drifts.
         this.mouseAbsolute = peer.createDataChannel("mouseAbsolute", {
-            ordered: false,
-            maxRetransmits: 0
+            ordered: false
         })
         this.mouseRelative = peer.createDataChannel("mouseRelative", {
             ordered: false
@@ -1020,7 +1078,7 @@ export class StreamInput {
         }
     }
     onGamepadUpdate() {
-        const gamepads = navigator.getGamepads()
+        const gamepads = this.timedGetGamepads()
         if (this.gamepads.size === 0) return
 
         // Fast path for single registered gamepad (most common case):
@@ -1223,10 +1281,12 @@ export class StreamInput {
     }
     private tryOpenControllerChannel(id: number) {
         if (!this.controllerInputs[id]) {
-            this.controllerInputs[id] = this.peer?.createDataChannel(`controller${id}`, {
-                maxRetransmits: 0,
-                ordered: false,
-            }) ?? null
+            // Ordered + reliable — see the FORWARD-TSN note in setPeer() for
+            // why partial reliability is forbidden. Ordered specifically
+            // because controller messages are full state snapshots sent on
+            // change: a retransmitted stale "button down" state applied after
+            // its release would leave the button stuck until the next input.
+            this.controllerInputs[id] = this.peer?.createDataChannel(`controller${id}`) ?? null
         }
     }
 

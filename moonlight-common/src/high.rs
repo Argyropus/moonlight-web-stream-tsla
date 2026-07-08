@@ -715,6 +715,17 @@ mod stream {
             let server_codec_mode_support = self.server_codec_mode_support().await?;
             let gfe_version = self.gfe_version().await?.to_owned();
 
+            // moonlight-common-c's STREAM_CFG_AUTO resolution only checks RFC1918/
+            // link-local ranges — loopback is NOT in its private-address list, so
+            // streaming from 127.0.0.1 (streamer on the same machine as the host)
+            // gets classified as REMOTE, force-capping the packet size at 1024 and
+            // enabling remote-streaming behavior on a loopback link. Classify
+            // loopback as Local ourselves and let Auto handle everything else.
+            let streaming_remotely = match address.parse::<std::net::IpAddr>() {
+                Ok(ip) if ip.is_loopback() => StreamingConfig::Local,
+                _ => StreamingConfig::Auto,
+            };
+
             let instance_clone = instance.clone();
             let connection = spawn_blocking(move || {
                 let server_info = ServerInfo {
@@ -731,7 +742,7 @@ mod stream {
                     fps: fps as i32,
                     bitrate: bitrate as i32,
                     packet_size: packet_size as i32,
-                    streaming_remotely: StreamingConfig::Auto,
+                    streaming_remotely,
                     audio_configuration: audio_decoder.config().raw() as i32,
                     supported_video_formats: video_decoder.supported_formats(),
                     client_refresh_rate_x100: (fps * 100) as i32,
