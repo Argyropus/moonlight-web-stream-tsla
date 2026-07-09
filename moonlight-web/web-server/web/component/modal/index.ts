@@ -118,6 +118,7 @@ class MessageModal implements Component, Modal<void> {
         this.textElement.innerText = message
 
         this.okButton.innerText = "Ok"
+        this.okButton.classList.add("button-primary")
 
         this.signal = init?.signal
     }

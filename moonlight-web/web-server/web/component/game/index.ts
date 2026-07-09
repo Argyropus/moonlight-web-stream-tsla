@@ -22,6 +22,7 @@ export class Game implements Component {
     private imageBlob: Blob | null = null
     private imageBlobUrl: string | null = null
     private imageElement: HTMLImageElement = document.createElement("img")
+    private titleElement: HTMLParagraphElement = document.createElement("p")
 
     private cache: GameCache
 
@@ -39,10 +40,14 @@ export class Game implements Component {
 
         this.forceLoadImage(false)
 
+        // Configure title
+        this.titleElement.classList.add("app-title")
+
         // Configure div
         this.divElement.classList.add("app")
 
         this.divElement.appendChild(this.imageElement)
+        this.divElement.appendChild(this.titleElement)
 
         this.divElement.addEventListener("click", this.onClick.bind(this))
         this.divElement.addEventListener("contextmenu", this.onContextMenu.bind(this))
@@ -80,6 +85,9 @@ export class Game implements Component {
 
     updateCache(cache: GameCache) {
         this.cache = cache
+
+        this.titleElement.innerText = cache.title
+        this.titleElement.title = cache.title
 
         this.divElement.classList.remove("app-inactive")
         this.divElement.classList.remove("app-active")

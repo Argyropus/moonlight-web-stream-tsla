@@ -27,9 +27,6 @@ export function setContextMenu(event: MouseEvent, init?: ContextMenuInit) {
         return;
     }
 
-    contextMenuElement.style.setProperty("left", `${event.pageX}px`)
-    contextMenuElement.style.setProperty("top", `${event.pageY}px`)
-
     contextMenuList.clear()
 
     for (const element of init?.elements ?? []) {
@@ -37,6 +34,17 @@ export function setContextMenu(event: MouseEvent, init?: ContextMenuInit) {
     }
 
     contextMenuList.mount(contextMenuElement)
+
+    // The menu is position: fixed, so it must be placed with viewport
+    // coordinates (clientX/Y) — pageX/Y are document coordinates and drift
+    // by the scroll offset. Clamp so the menu stays inside the viewport.
+    const margin = 8
+    const left = Math.min(event.clientX, window.innerWidth - contextMenuElement.offsetWidth - margin)
+    const top = Math.min(event.clientY, window.innerHeight - contextMenuElement.offsetHeight - margin)
+
+    contextMenuElement.style.setProperty("left", `${Math.max(margin, left)}px`)
+    contextMenuElement.style.setProperty("top", `${Math.max(margin, top)}px`)
+
     contextMenuElement.classList.remove("context-menu-disabled")
 }
 

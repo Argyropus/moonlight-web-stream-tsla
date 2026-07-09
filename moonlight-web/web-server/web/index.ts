@@ -84,13 +84,16 @@ class MainApp implements Component {
         this.headerBar.appendChild(this.headerRight)
 
         // Moonlight title / Dynamic Header
-        this.moonlightTextElement.innerHTML = `<img width="80" height="80" src="${TESLA_LOGO}" alt="Moonlight Web">`
+        this.moonlightTextElement.innerHTML = `<img width="48" height="48" src="${TESLA_LOGO}" alt="Moonlight Web">`
         this.moonlightTextElement.classList.add("header-title")
         this.headerCenter.appendChild(this.moonlightTextElement)
 
         // Back button (left side)
         this.backToHostsButton.classList.add("back-button")
-        this.backToHostsButton.innerHTML = "&larr;" // Left arrow icon
+        this.backToHostsButton.title = "Back"
+        this.backToHostsButton.innerHTML = `<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="white" width="28" height="28">
+            <path d="M20 11H7.83l5.59-5.59L12 4l-8 8 8 8 1.41-1.41L7.83 13H20v-2z"/>
+        </svg>`
         this.backToHostsButton.style.display = "none"
         this.backToHostsButton.addEventListener("click", () => this.setCurrentDisplay("hosts"))
         this.headerLeft.appendChild(this.backToHostsButton)
@@ -212,14 +215,14 @@ class MainApp implements Component {
         if (display == "hosts") {
             //this.moonlightTextElement.innerText = "Moonlight Web"
             this.backToHostsButton.style.display = "none"
-            this.hostAddButton.style.display = "block"
-            this.settingsButton.style.display = "block"
+            this.hostAddButton.style.display = ""
+            this.settingsButton.style.display = ""
 
             this.hostList.mount(this.appContent)
             pushAppState({ display: "hosts" })
         } else if (display == "games" && hostId != null) {
             //this.moonlightTextElement.innerText = "Games"
-            this.backToHostsButton.style.display = "block"
+            this.backToHostsButton.style.display = ""
             this.hostAddButton.style.display = "none"
             this.settingsButton.style.display = "none"
 
@@ -232,7 +235,7 @@ class MainApp implements Component {
             pushAppState({ display: "games", hostId: this.gameList?.getHostId() })
         } else if (display == "settings") {
             //this.moonlightTextElement.innerText = "Settings"
-            this.backToHostsButton.style.display = "block"
+            this.backToHostsButton.style.display = ""
             this.hostAddButton.style.display = "none"
             this.settingsButton.style.display = "none"
 
