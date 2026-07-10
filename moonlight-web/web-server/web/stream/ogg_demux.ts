@@ -114,7 +114,10 @@ export class OggPageDemuxer {
                 // the native decoder. A 0 terminating a 255-multiple packet is
                 // NOT this case — there offset > packetStart.
                 if (offset > packetStart) {
-                    packets.push(data.slice(packetStart, offset))
+                    // subarray, not slice: packets are consumed synchronously
+                    // (EncodedAudioChunk copies on construction), so a view is
+                    // safe and skips one copy per packet.
+                    packets.push(data.subarray(packetStart, offset))
                 }
                 packetStart = offset
             }

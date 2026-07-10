@@ -1,14 +1,13 @@
 use std::io::Write;
 use std::sync::Arc;
 
-use bytes::Bytes;
 use log::{info, warn};
 use moonlight_common::stream::{
     audio::AudioDecoder,
     bindings::{AudioConfig, OpusMultistreamConfig},
 };
 use ogg::{PacketWriteEndInfo, PacketWriter};
-use tokio::sync::mpsc::{self, Sender, UnboundedSender};
+use tokio::sync::mpsc::{self, Sender};
 use tokio::sync::Notify;
 use tokio::time::{self, Duration};
 use webrtc::{
@@ -39,7 +38,7 @@ pub fn register_audio_codecs(media_engine: &mut MediaEngine) -> Result<(), webrt
 pub struct OpusTrackSampleAudioDecoder {
     channel: Arc<RTCDataChannel>,
     channel_open: Arc<Notify>,
-    sender: Option<Sender<Bytes>>,
+    sender: Option<Sender<Vec<u8>>>,
     config: Option<OpusMultistreamConfig>,
 }
 
@@ -54,12 +53,13 @@ impl OpusTrackSampleAudioDecoder {
     }
 }
 
-struct VecSender(UnboundedSender<Bytes>);
-impl Write for VecSender {
+/// `io::Write` sink appending into a `BytesMut`, so the Ogg writer serializes
+/// pages straight into the DataChannel aggregation buffer (no intermediate
+/// chunk copies or channel hop).
+struct BytesMutWriter(bytes::BytesMut);
+impl Write for BytesMutWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0
-            .send(Bytes::copy_from_slice(buf))
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::BrokenPipe))?;
+        self.0.extend_from_slice(buf);
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -93,7 +93,7 @@ impl AudioDecoder for OpusTrackSampleAudioDecoder {
         let samples_per_frame = stream_config.samples_per_frame as u64;
         self.config = Some(stream_config);
 
-        let (sender, mut receiver) = mpsc::channel::<Bytes>(50);
+        let (sender, mut receiver) = mpsc::channel::<Vec<u8>>(50);
         self.sender = Some(sender);
 
         let channel = self.channel.clone();
@@ -106,8 +106,9 @@ impl AudioDecoder for OpusTrackSampleAudioDecoder {
                 channel_open.notified().await;
             }
 
-            let (chunk_tx, mut chunk_rx) = mpsc::unbounded_channel::<Bytes>();
-            let mut writer = PacketWriter::new(VecSender(chunk_tx));
+            // Ogg pages are serialized directly into this writer's BytesMut,
+            // which doubles as the aggregation buffer for outgoing sends.
+            let mut writer = PacketWriter::new(BytesMutWriter(bytes::BytesMut::with_capacity(4096)));
             let serial = 12345;
             let mut granule_pos = 0;
 
@@ -147,19 +148,14 @@ impl AudioDecoder for OpusTrackSampleAudioDecoder {
                 warn!("Failed to write comment header: {:?}", e);
             }
 
-            // Collect initial header chunks and send them together
-            let mut initial_payload = Vec::new();
-            while let Ok(chunk) = chunk_rx.try_recv() {
-                initial_payload.extend_from_slice(&chunk);
-            }
-            if !initial_payload.is_empty() {
-                if let Err(e) = channel.send(&Bytes::from(initial_payload)).await {
-                    warn!("Failed to send Ogg headers: {:?}", e);
-                }
+            // Send the header pages together as the first message.
+            let initial_payload = writer.inner_mut().0.split().freeze();
+            if !initial_payload.is_empty()
+                && let Err(e) = channel.send(&initial_payload).await
+            {
+                warn!("Failed to send Ogg headers: {:?}", e);
             }
 
-            // Aggregation buffer for outgoing chunks
-            let mut pending = bytes::BytesMut::with_capacity(4096);
             // Flush interval — batches multiple Opus frames into one DataChannel message.
             // At 48kHz/5ms per frame, 10ms accumulates ~2 frames per send.
             let mut interval = time::interval(Duration::from_millis(10));
@@ -168,8 +164,8 @@ impl AudioDecoder for OpusTrackSampleAudioDecoder {
                 tokio::select! {
                     biased;
                     _ = interval.tick() => {
-                        if !pending.is_empty() {
-                            let payload = pending.split().freeze();
+                        if !writer.inner_mut().0.is_empty() {
+                            let payload = writer.inner_mut().0.split().freeze();
                             if let Err(e) = channel.send(&payload).await {
                                 warn!("Failed to send aggregated audio data: {:?}", e);
                             }
@@ -180,8 +176,9 @@ impl AudioDecoder for OpusTrackSampleAudioDecoder {
                             Some(data) => {
                                 granule_pos += samples_per_frame;
 
+                                // `data` is moved in as Cow::Owned — no copy.
                                 if let Err(e) = writer.write_packet(
-                                    data.to_vec(),
+                                    data,
                                     serial,
                                     PacketWriteEndInfo::EndPage,
                                     granule_pos,
@@ -189,22 +186,18 @@ impl AudioDecoder for OpusTrackSampleAudioDecoder {
                                     warn!("Failed to write audio packet: {:?}", e);
                                 }
 
-                                // Drain any chunks produced by writer and append to pending
-                                while let Ok(chunk) = chunk_rx.try_recv() {
-                                    pending.extend_from_slice(&chunk);
-                                }
-                                // If pending is large, flush immediately
-                                if pending.len() >= 16 * 1024 {
-                                    let payload = pending.split().freeze();
+                                // If the accumulated payload is large, flush immediately
+                                if writer.inner_mut().0.len() >= 16 * 1024 {
+                                    let payload = writer.inner_mut().0.split().freeze();
                                     if let Err(e) = channel.send(&payload).await {
                                         warn!("Failed to send aggregated audio data (eager flush): {:?}", e);
                                     }
                                 }
                             }
                             None => {
-                                // Receiver closed — flush any pending and exit
-                                if !pending.is_empty() {
-                                    let payload = pending.split().freeze();
+                                // Receiver closed — flush anything buffered and exit
+                                if !writer.inner_mut().0.is_empty() {
+                                    let payload = writer.inner_mut().0.split().freeze();
                                     if let Err(e) = channel.send(&payload).await {
                                         warn!("Failed to send final aggregated audio data: {:?}", e);
                                     }
@@ -226,7 +219,10 @@ impl AudioDecoder for OpusTrackSampleAudioDecoder {
 
     fn decode_and_play_sample(&mut self, data: &[u8]) {
         if let Some(sender) = &self.sender {
-            let data = Bytes::copy_from_slice(data);
+            // One owned copy of the FFI slice; the Ogg writer takes ownership
+            // of it downstream (Cow::Owned), so this is the only copy made
+            // before the page bytes land in the aggregation buffer.
+            let data = data.to_vec();
             // Use try_send to never block the audio receive thread.
             // If the channel is full (data channel transport backpressure),
             // drop the frame — real-time audio should prefer dropping over stalling.

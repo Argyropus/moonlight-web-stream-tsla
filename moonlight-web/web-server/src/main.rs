@@ -185,7 +185,10 @@ async fn main2() -> Result<(), anyhow::Error> {
                 .service(web_config_js_service())
                 .service(web_service())
         }
-    });
+    })
+    // Default is one worker per logical CPU — far more than a single-user
+    // server needs on a box that also runs the game, encoder, and streamer.
+    .workers(2);
 
     if let Some(certificate) = config.certificate.as_ref() {
         let mut builder = SslAcceptor::mozilla_intermediate(SslMethod::tls())

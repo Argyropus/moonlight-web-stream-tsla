@@ -47,13 +47,19 @@ class PcmPlaybackProcessor extends AudioWorkletProcessor {
         this.priming = true;
         // Direct PCM port from decode worker (bypasses main thread entirely)
         this.pcmPort = null;
+        // Used ArrayBuffers awaiting transfer back to the decode worker's
+        // buffer pool. Returning them in batches (one message per ~32 buffers)
+        // keeps both realms free of per-decode garbage — GC on the audio
+        // rendering thread is a dropout risk on weak devices.
+        this.recycleStash = [];
 
         this.port.onmessage = (event) => {
             const data = event.data;
             if (!data) return;
 
             if (data.type === 'pcm') {
-                this._handlePcm(data);
+                // Arrived via the main thread — not part of the worker's pool.
+                this._handlePcm(data, false);
             } else if (data.type === 'enable-stats') {
                 this.statsEnabled = true;
             } else if (data.type === 'disable-stats') {
@@ -63,7 +69,7 @@ class PcmPlaybackProcessor extends AudioWorkletProcessor {
                 this.pcmPort = data.port;
                 this.pcmPort.onmessage = (e) => {
                     if (e.data && e.data.type === 'pcm') {
-                        this._handlePcm(e.data);
+                        this._handlePcm(e.data, true);
                     }
                 };
             } else if (data.type === 'get-stats') {
@@ -72,11 +78,23 @@ class PcmPlaybackProcessor extends AudioWorkletProcessor {
         };
     }
 
-    _handlePcm(data) {
+    _handlePcm(data, returnable) {
         const left = data.left instanceof Float32Array ? data.left : new Float32Array(data.left);
         const right = data.right instanceof Float32Array ? data.right : new Float32Array(data.right);
         this._writeToRing(left, right);
         this.framesWritten++;
+
+        // The samples are now copied into the ring — hand the buffers back to
+        // the decode worker for reuse instead of letting them become garbage.
+        if (returnable && this.pcmPort
+            && data.left instanceof ArrayBuffer && data.right instanceof ArrayBuffer) {
+            this.recycleStash.push(data.left, data.right);
+            if (this.recycleStash.length >= 32) {
+                const buffers = this.recycleStash;
+                this.recycleStash = [];
+                this.pcmPort.postMessage({ type: 'recycle', buffers }, buffers);
+            }
+        }
     }
 
     _writeToRing(left, right) {

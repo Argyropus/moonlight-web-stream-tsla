@@ -21,7 +21,10 @@ moonlight-common-sys = { path = "./moonlight-common-sys", features = [
 ] }
 
 # Log
-log = "0.4.28"
+# release_max_level_info compiles debug!/trace! away in release builds across
+# the whole dependency graph (incl. webrtc-rs hot paths); the runtime filter
+# is already Info in both binaries, so behavior is unchanged.
+log = { version = "0.4.28", features = ["release_max_level_info"] }
 simplelog = "0.12.2"
 printf-compat = { version = "0.2.1" }
 
@@ -80,3 +83,13 @@ cmake = { version = "0.1.54" }
 [workspace.lints.clippy]
 too_many_arguments = "allow"
 unwrap_used = "warn"
+
+# Profile settings only take effect at the workspace root. The streamer's
+# per-RTP-packet path (packetize -> SRTP -> socket) spans several crates, so
+# LTO + a single codegen unit matter more here than usual.
+# panic stays "unwind": actix isolates per-request panics in the web-server,
+# and the streamer already aborts via its own panic hook.
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true
