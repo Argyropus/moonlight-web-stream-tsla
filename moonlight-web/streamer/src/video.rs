@@ -120,19 +120,13 @@ impl TrackSampleVideoDecoder {
         timestamp: u32,
         _frame_interval: Duration,
     ) {
-        // Packetize the whole frame into one batch and hand it to the pacer
-        // with a single channel send (instead of one send per RTP packet).
-        // The pacer still meters out individual packets.
-        let estimated_packets = samples
-            .iter()
-            .map(|s| s.len() / RTP_OUTBOUND_MTU + 1)
-            .sum();
-        let mut frame_packets = Vec::with_capacity(estimated_packets);
-
+        // Send all RTP packets for this frame as a burst.
+        // The playout-delay extension (min=20ms, max=100ms) gives the receiver's
+        // jitter buffer headroom to absorb arrival jitter from burst sending.
+        // Pacing would help on cellular but would block the callback thread.
         let mut peekable = samples.drain(..).peekable();
         while let Some(sample) = peekable.next() {
-            if let Err(err) = packetize_into(
-                &mut frame_packets,
+            let packets = match packetize(
                 payloader,
                 RTP_OUTBOUND_MTU,
                 0, // is set in the write fn
@@ -140,12 +134,16 @@ impl TrackSampleVideoDecoder {
                 &sample,
                 peekable.peek().is_none(),
             ) {
-                warn!("failed to packetize packet: {err:?}");
-            }
-        }
+                Ok(value) => value,
+                Err(err) => {
+                    warn!("failed to packetize packet: {err:?}");
+                    continue;
+                }
+            };
 
-        if !frame_packets.is_empty() {
-            sender.blocking_send_batch(frame_packets);
+            for packet in packets {
+                sender.blocking_send_sample(packet);
+            }
         }
     }
 }
@@ -358,18 +356,17 @@ impl VideoDecoder for TrackSampleVideoDecoder {
     }
 }
 
-fn packetize_into(
-    packets: &mut Vec<Packet>,
+fn packetize(
     payloader: &mut impl Payloader,
     mtu: usize,
     sequence_number: u16,
     timestamp: u32,
     payload: &Bytes,
     end_has_marker: bool,
-) -> Result<(), anyhow::Error> {
+) -> Result<Vec<Packet>, anyhow::Error> {
     let payloads = payloader.payload(mtu - 12, payload)?;
     let payloads_len = payloads.len();
-    packets.reserve(payloads_len);
+    let mut packets = Vec::with_capacity(payloads_len);
     for (i, payload) in payloads.into_iter().enumerate() {
         packets.push(Packet {
             header: Header {
@@ -387,7 +384,7 @@ fn packetize_into(
         });
     }
 
-    Ok(())
+    Ok(packets)
 }
 
 pub(crate) fn video_format_to_codec(format: VideoFormat) -> Option<RTCRtpCodecParameters> {

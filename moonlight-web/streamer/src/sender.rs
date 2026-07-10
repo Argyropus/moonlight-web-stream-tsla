@@ -29,9 +29,7 @@ where
 {
     channel_queue_size: usize,
     pub(crate) stream: Arc<StreamConnection>,
-    // Samples travel in per-frame batches: one channel send per frame instead
-    // of one per RTP packet (~40x fewer mutex+waker ops at 1080p60).
-    sender: Option<Sender<Vec<Track::Sample>>>,
+    sender: Option<Sender<Track::Sample>>,
 }
 
 impl<Track> TrackLocalSender<Track>
@@ -102,9 +100,9 @@ where
         Ok(())
     }
 
-    pub fn blocking_send_batch(&self, batch: Vec<Track::Sample>) {
+    pub fn blocking_send_sample(&self, sample: Track::Sample) {
         if let Some(sender) = self.sender.as_ref() {
-            let _ = sender.blocking_send(batch);
+            let _ = sender.blocking_send(sample);
         }
     }
 }
@@ -159,7 +157,7 @@ const PACE_QUEUE_MAX: usize = 4096;
 
 async fn sample_sender<Track>(
     track: Arc<Track>,
-    mut receiver: Receiver<Vec<Track::Sample>>,
+    mut receiver: Receiver<Track::Sample>,
     pace_bytes_per_sec: u64,
 ) where
     Track: TrackLike,
@@ -190,7 +188,7 @@ async fn sample_sender<Track>(
         // while we pace.
         loop {
             match receiver.try_recv() {
-                Ok(batch) => queue.extend(batch),
+                Ok(sample) => queue.push_back(sample),
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     open = false;
@@ -212,7 +210,7 @@ async fn sample_sender<Track>(
                 break;
             }
             match receiver.recv().await {
-                Some(batch) => queue.extend(batch),
+                Some(sample) => queue.push_back(sample),
                 None => open = false,
             }
             continue;
@@ -232,7 +230,7 @@ async fn sample_sender<Track>(
                 tokio::select! {
                     _ = &mut sleep => break,
                     received = receiver.recv(), if open => match received {
-                        Some(batch) => queue.extend(batch),
+                        Some(sample) => queue.push_back(sample),
                         None => open = false,
                     }
                 }
@@ -240,19 +238,11 @@ async fn sample_sender<Track>(
             continue;
         }
 
-        // Pause state only changes at setup/renegotiation, so checking it once
-        // per drain burst (instead of per packet inside write_with_extensions)
-        // avoids an async lock acquisition inside webrtc-rs for every packet.
-        let paused = track.writes_paused().await;
         while budget > 0.0 {
             let Some(sample) = queue.pop_front() else {
                 break;
             };
             budget -= Track::sample_size(&sample) as f64;
-            if paused {
-                // Drop without writing so sequence numbers don't increment.
-                continue;
-            }
             if let Err(err) = track
                 .write_with_extensions(
                     sample,
@@ -271,13 +261,6 @@ pub trait TrackLike: Send + Sync + 'static {
 
     /// Approximate wire size of a sample, used by the pacer's token bucket.
     fn sample_size(sample: &Self::Sample) -> usize;
-
-    /// True while no binding will accept writes (e.g. transceiver not yet
-    /// negotiated). Checked once per drain burst by the pacer; samples are
-    /// dropped without side effects while paused.
-    fn writes_paused(&self) -> impl Future<Output = bool> + Send {
-        async { false }
-    }
 
     fn write_with_extensions(
         &self,
@@ -341,18 +324,16 @@ impl TrackLike for SequencedTrackLocalStaticRTP {
         12 + sample.payload.len()
     }
 
-    fn writes_paused(&self) -> impl Future<Output = bool> + Send {
-        // If a write happened while paused, the sequence number would
-        // increment without anything being sent — the pacer checks this
-        // before each drain burst and drops instead.
-        self.track.all_binding_paused()
-    }
-
     async fn write_with_extensions(
         &self,
         mut sample: Self::Sample,
         extensions: &[HeaderExtension],
     ) -> Result<(), anyhow::Error> {
+        if self.track.all_binding_paused().await {
+            // Abort already here to not increment sequence numbers.
+            return Ok(());
+        }
+
         sample.header.sequence_number = self.sequence_number.fetch_add(1, Ordering::Relaxed);
 
         self.track

@@ -70,9 +70,7 @@ let useMainThread = false
 // copyToChannel so we can reuse them instead of allocating new ones per decode.
 // This eliminates the MinorGC pauses caused by rapid Float32Array churn.
 const pcmBufferPool: ArrayBuffer[] = []
-// Sized to cover the worklet's ~32-buffer recycle batch still in flight plus
-// the frames actively being decoded.
-const PCM_POOL_MAX = 64
+const PCM_POOL_MAX = 32 // enough for ~300ms of audio at 48kHz/10ms frames
 
 // The WASM file lives one directory up from this worker (at the web root),
 // but fetch() in a worker resolves relative URLs against the worker's own URL
@@ -407,18 +405,6 @@ workerSelf.onmessage = (event: MessageEvent<WorkerInMessage | ArrayBuffer>) => {
         // Main thread is giving us a direct MessagePort to the AudioWorklet.
         // From now on, send decoded PCM directly there (bypasses main thread).
         pcmDirectPort = (data as any).port as MessagePort
-        // The worklet transfers used PCM buffers back in batches on this same
-        // port — refill the pool so steady-state decoding allocates nothing.
-        pcmDirectPort.onmessage = (event: MessageEvent) => {
-            const msg = event.data
-            if (msg && msg.type === "recycle") {
-                for (const buf of msg.buffers as ArrayBuffer[]) {
-                    if (pcmBufferPool.length < PCM_POOL_MAX) {
-                        pcmBufferPool.push(buf)
-                    }
-                }
-            }
-        }
         // Flush startup-buffered frames to the worklet.
         // The worklet's ring buffer cap (200ms) will discard excess if needed.
         for (const frame of pendingFrames) {
