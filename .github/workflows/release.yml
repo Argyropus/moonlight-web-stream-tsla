@@ -40,9 +40,11 @@ jobs:
     - name: Install 7Zip
       run: sudo apt-get update && sudo apt-get install -y p7zip-full
 
-    # 🌟 새로 추가할 부분: 에러를 일으키는 패키지만 강제로 최신 호환 버전으로 업데이트
-    - name: Fix printf-compat Error
-      run: cargo update -p printf-compat
+    # 🌟 추가할 부분: 프로젝트의 Rust 버전을 2024년 3월 1일로 덮어써서 에러를 원천 차단합니다.
+    - name: Force older Rust Nightly (Fix printf-compat)
+      run: |
+        echo '[toolchain]' > rust-toolchain.toml
+        echo 'channel = "nightly-2024-03-01"' >> rust-toolchain.toml
 
     # 프로젝트에 있는 Buildall.ps1 파워쉘 스크립트 실행
     - name: Run Build Script
