@@ -31,11 +31,23 @@ jobs:
       with:
         node-version: '20'
 
+    - name: 🛠️ The Ultimate Patch (2025 Golden Nightly)
+      shell: bash
+      run: |
+        # 1. 2026년 최신 환경에서 터지는 라이브러리와 2024년 구버전에서 터지는 최신 문법이 모두 호환되는 시점으로 고정
+        echo '[toolchain]' > rust-toolchain.toml
+        echo 'channel = "nightly-2025-05-01"' >> rust-toolchain.toml
+
+        # 2. 해당 시점에서 아직 실험적이었던 배열 추론 문법([0u8; _]) 에러를 해결하기 위해 코드 상단에 허용 플래그 삽입
+        if [ -f "moonlight-common/src/lib.rs" ]; then
+          sed -i '1i #![allow(incomplete_features)]\n#![feature(generic_arg_infer)]' moonlight-common/src/lib.rs
+        fi
+
     - name: Install Frontend Dependencies
       working-directory: ./moonlight-web/web-server
       run: npm install
 
-    - name: Run Frontend Build ONLY
+    - name: Run Frontend Build ONLY (Docker 배제)
       shell: pwsh
       run: |
         $content = Get-Content buildAll.ps1 -Raw
@@ -43,27 +55,7 @@ jobs:
         Set-Content buildAll-Frontend.ps1 $frontendOnly
         ./buildAll-Frontend.ps1
 
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
-
-    - name: 🛠️ Fix Project Dependency Issues (마법의 패치)
-      shell: bash
-      run: |
-        # 1. 문제의 printf-compat 최신 버전으로 강제 업데이트
-        cargo update -p printf-compat
-        
-        # 2. 불안정한 Rust 문법([0u8; _])을 구버전에서도 호환되는 고정 길이로 강제 교체
-        if [ -f "moonlight-common/src/network/launch.rs" ]; then
-          sed -i 's/\[0u8; _\]/\[0u8; 32\]/g' moonlight-common/src/network/launch.rs
-        fi
-        if [ -f "moonlight-common/src/network/mod.rs" ]; then
-          sed -i 's/\[0u8; _\]/\[0u8; 32\]/g' moonlight-common/src/network/mod.rs
-        fi
-
-        # 3. Nightly 강제 설정을 해제하여 안정된 버전(Stable)으로 빌드하도록 유도
-        rm -f rust-toolchain.toml rust-toolchain
-
-    - name: Build Backend (순정 Cargo 빌드)
+    - name: Build Backend (Cargo Build)
       run: cargo build --release
 
     - name: Package Artifacts (Windows)
