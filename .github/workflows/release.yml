@@ -1,68 +1,84 @@
-name: Build and Release
+name: Build and Release (No Docker)
 
 on:
   push:
     tags:
-      - 'v*' # v1.0.0 같은 태그가 푸시되면 실행됩니다.
+      - 'v*'
 
 permissions:
   contents: write
 
 jobs:
   build-and-release:
-    name: Run Buildall Script and Release
-    runs-on: ubuntu-latest
+    name: Build for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            archive_name: moonlight-linux.tar.gz
+          - os: windows-latest
+            archive_name: moonlight-windows.zip
 
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        submodules: recursive  # 🌟 이 두 줄을 추가! (서브모듈까지 전부 다운로드)
+        submodules: recursive # 서브모듈 누락 에러 방지!
 
-
-    # 프론트엔드 빌드를 위한 Node.js 세팅
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '20' # 필요에 따라 버전을 조절하세요 (예: '18', '20')
+        node-version: '20'
 
-    # 프론트엔드 의존성 설치 (스크립트에 npm install이 없으므로 여기서 실행해 줍니다)
     - name: Install Frontend Dependencies
       working-directory: ./moonlight-web/web-server
       run: npm install
 
-    # Rust 세팅
-    - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@nightly
+    - name: Run Frontend Build ONLY (도커 부분 제거)
+      shell: pwsh
+      run: |
+        # buildAll.ps1 스크립트에서 cross(도커)를 사용하는 반복문부터 끝까지를 삭제하고 실행합니다.
+        $content = Get-Content buildAll.ps1 -Raw
+        $frontendOnly = $content -replace '(?s)foreach\(\$target in \$targets\).*', ''
+        Set-Content buildAll-Frontend.ps1 $frontendOnly
+        ./buildAll-Frontend.ps1
 
-    # 크로스 컴파일을 위한 cross 도구 설치 (가장 빠른 설치 방식 사용)
-    - name: Install cross
-      uses: taiki-e/install-action@cross
-
-    # 패키징을 위한 7zip 설치
-    - name: Install 7Zip
-      run: sudo apt-get update && sudo apt-get install -y p7zip-full
-
-    # 이 부분으로 기존 단계를 덮어씌워 주세요.
     - name: Set Compatible Rust Version and Fix Syntax
+      shell: bash
       run: |
         echo '[toolchain]' > rust-toolchain.toml
         echo 'channel = "nightly-2025-05-01"' >> rust-toolchain.toml
-        
-        # moonlight-common의 lib.rs 파일 맨 윗줄에 최신 문법 허용(feature) 선언을 강제로 삽입합니다.
         echo "#![feature(generic_arg_infer)]" | cat - moonlight-common/src/lib.rs > temp && mv temp moonlight-common/src/lib.rs
 
+    - name: Build Backend (순정 Cargo 빌드 - 도커 안 씀!)
+      run: cargo build --release
 
-
-    # 프로젝트에 있는 Buildall.ps1 파워쉘 스크립트 실행
-    - name: Run Build Script
+    - name: Package Artifacts (Windows)
+      if: matrix.os == 'windows-latest'
       shell: pwsh
-      run: ./buildAll.ps1
+      run: |
+        New-Item -ItemType Directory -Path ./release-files
+        Copy-Item finalOutput/static ./release-files/ -Recurse
+        Copy-Item target/release/streamer.exe ./release-files/
+        Copy-Item target/release/web-server.exe ./release-files/
+        Copy-Item acme-certificate.ps1 ./release-files/ -ErrorAction SilentlyContinue
+        Copy-Item setup.ps1 ./release-files/ -ErrorAction SilentlyContinue
+        Compress-Archive -Path ./release-files/* -DestinationPath ./${{ matrix.archive_name }}
 
-    # finalOutput 폴더에 생성된 압축 파일들을 깃헙 릴리즈에 업로드
+    - name: Package Artifacts (Linux)
+      if: matrix.os == 'ubuntu-latest'
+      shell: bash
+      run: |
+        mkdir ./release-files
+        cp -r finalOutput/static ./release-files/
+        cp target/release/streamer ./release-files/
+        cp target/release/web-server ./release-files/
+        tar -czvf ./${{ matrix.archive_name }} -C ./release-files .
+
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        files: finalOutput/*
+        files: ${{ matrix.archive_name }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
