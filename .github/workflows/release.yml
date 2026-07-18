@@ -16,6 +16,9 @@ jobs:
     steps:
     - name: Checkout code
       uses: actions/checkout@v4
+      with:
+        submodules: recursive  # 🌟 이 두 줄을 추가! (서브모듈까지 전부 다운로드)
+
 
     # 프론트엔드 빌드를 위한 Node.js 세팅
     - name: Setup Node.js
