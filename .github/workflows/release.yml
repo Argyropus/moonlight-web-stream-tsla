@@ -1,0 +1,54 @@
+name: Build and Release
+
+on:
+  push:
+    tags:
+      - 'v*' # v1.0.0 같은 태그가 푸시되면 실행됩니다.
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Run Buildall Script and Release
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+
+    # 프론트엔드 빌드를 위한 Node.js 세팅
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '20' # 필요에 따라 버전을 조절하세요 (예: '18', '20')
+
+    # 프론트엔드 의존성 설치 (스크립트에 npm install이 없으므로 여기서 실행해 줍니다)
+    - name: Install Frontend Dependencies
+      working-directory: ./moonlight-web/web-server
+      run: npm install
+
+    # Rust 세팅
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    # 크로스 컴파일을 위한 cross 도구 설치 (가장 빠른 설치 방식 사용)
+    - name: Install cross
+      uses: taiki-e/install-action@cross
+
+    # 패키징을 위한 7zip 설치
+    - name: Install 7Zip
+      run: sudo apt-get update && sudo apt-get install -y p7zip-full
+
+    # 프로젝트에 있는 Buildall.ps1 파워쉘 스크립트 실행
+    - name: Run Build Script
+      shell: pwsh
+      run: ./Buildall.ps1
+
+    # finalOutput 폴더에 생성된 압축 파일들을 깃헙 릴리즈에 업로드
+    - name: Upload to GitHub Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: finalOutput/*
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
