@@ -10,15 +10,8 @@ permissions:
 
 jobs:
   build-and-release:
-    name: Build for ${{ matrix.os }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - os: ubuntu-latest
-            archive_name: moonlight-linux.tar.gz
-          - os: windows-latest
-            archive_name: moonlight-windows.zip
+    name: Build for Linux
+    runs-on: ubuntu-latest
 
     steps:
     - name: Checkout code
@@ -34,11 +27,8 @@ jobs:
     - name: 🛠️ The Ultimate Patch (2025 Golden Nightly)
       shell: bash
       run: |
-        # 1. 2026년 최신 환경에서 터지는 라이브러리와 2024년 구버전에서 터지는 최신 문법이 모두 호환되는 시점으로 고정
         echo '[toolchain]' > rust-toolchain.toml
         echo 'channel = "nightly-2025-05-01"' >> rust-toolchain.toml
-
-        # 2. 해당 시점에서 아직 실험적이었던 배열 추론 문법([0u8; _]) 에러를 해결하기 위해 코드 상단에 허용 플래그 삽입
         if [ -f "moonlight-common/src/lib.rs" ]; then
           sed -i '1i #![allow(incomplete_features)]\n#![feature(generic_arg_infer)]' moonlight-common/src/lib.rs
         fi
@@ -47,7 +37,7 @@ jobs:
       working-directory: ./moonlight-web/web-server
       run: npm install
 
-    - name: Run Frontend Build ONLY (Docker 배제)
+    - name: Run Frontend Build ONLY
       shell: pwsh
       run: |
         $content = Get-Content buildAll.ps1 -Raw
@@ -58,31 +48,18 @@ jobs:
     - name: Build Backend (Cargo Build)
       run: cargo build --release
 
-    - name: Package Artifacts (Windows)
-      if: matrix.os == 'windows-latest'
-      shell: pwsh
-      run: |
-        New-Item -ItemType Directory -Path ./release-files
-        Copy-Item finalOutput/static ./release-files/ -Recurse
-        Copy-Item target/release/streamer.exe ./release-files/ -ErrorAction SilentlyContinue
-        Copy-Item target/release/web-server.exe ./release-files/ -ErrorAction SilentlyContinue
-        Copy-Item acme-certificate.ps1 ./release-files/ -ErrorAction SilentlyContinue
-        Copy-Item setup.ps1 ./release-files/ -ErrorAction SilentlyContinue
-        Compress-Archive -Path ./release-files/* -DestinationPath ./${{ matrix.archive_name }}
-
     - name: Package Artifacts (Linux)
-      if: matrix.os == 'ubuntu-latest'
       shell: bash
       run: |
         mkdir ./release-files
         cp -r finalOutput/static ./release-files/
         cp target/release/streamer ./release-files/ 2>/dev/null || true
         cp target/release/web-server ./release-files/ 2>/dev/null || true
-        tar -czvf ./${{ matrix.archive_name }} -C ./release-files .
+        tar -czvf ./moonlight-linux.tar.gz -C ./release-files .
 
     - name: Upload to GitHub Release
       uses: softprops/action-gh-release@v2
       with:
-        files: ${{ matrix.archive_name }}
+        files: moonlight-linux.tar.gz
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
