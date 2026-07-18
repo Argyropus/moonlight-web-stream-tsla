@@ -43,11 +43,14 @@ jobs:
     - name: Install 7Zip
       run: sudo apt-get update && sudo apt-get install -y p7zip-full
 
-    # 이 단계를 기존에 추가했던 땜질 코드 대신 넣어주세요!
-    - name: Set Compatible Rust Version
+    # 이 부분으로 기존 단계를 덮어씌워 주세요.
+    - name: Set Compatible Rust Version and Fix Syntax
       run: |
         echo '[toolchain]' > rust-toolchain.toml
         echo 'channel = "nightly-2025-05-01"' >> rust-toolchain.toml
+        
+        # moonlight-common의 lib.rs 파일 맨 윗줄에 최신 문법 허용(feature) 선언을 강제로 삽입합니다.
+        echo "#![feature(generic_arg_infer)]" | cat - moonlight-common/src/lib.rs > temp && mv temp moonlight-common/src/lib.rs
 
 
 
