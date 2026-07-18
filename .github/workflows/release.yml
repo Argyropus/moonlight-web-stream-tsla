@@ -30,7 +30,7 @@ jobs:
 
     # Rust 세팅
     - name: Install Rust toolchain
-      uses: dtolnay/rust-toolchain@stable
+      uses: dtolnay/rust-toolchain@nightly
 
     # 크로스 컴파일을 위한 cross 도구 설치 (가장 빠른 설치 방식 사용)
     - name: Install cross
