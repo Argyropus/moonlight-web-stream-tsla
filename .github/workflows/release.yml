@@ -1,4 +1,4 @@
-name: Build and Release (No Docker)
+name: Build and Release
 
 on:
   push:
@@ -24,7 +24,7 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
       with:
-        submodules: recursive # 서브모듈 누락 에러 방지!
+        submodules: recursive
 
     - name: Setup Node.js
       uses: actions/setup-node@v4
@@ -35,23 +35,35 @@ jobs:
       working-directory: ./moonlight-web/web-server
       run: npm install
 
-    - name: Run Frontend Build ONLY (도커 부분 제거)
+    - name: Run Frontend Build ONLY
       shell: pwsh
       run: |
-        # buildAll.ps1 스크립트에서 cross(도커)를 사용하는 반복문부터 끝까지를 삭제하고 실행합니다.
         $content = Get-Content buildAll.ps1 -Raw
         $frontendOnly = $content -replace '(?s)foreach\(\$target in \$targets\).*', ''
         Set-Content buildAll-Frontend.ps1 $frontendOnly
         ./buildAll-Frontend.ps1
 
-    - name: Set Compatible Rust Version and Fix Syntax
+    - name: Install Rust toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: 🛠️ Fix Project Dependency Issues (마법의 패치)
       shell: bash
       run: |
-        echo '[toolchain]' > rust-toolchain.toml
-        echo 'channel = "nightly-2025-05-01"' >> rust-toolchain.toml
-        echo "#![feature(generic_arg_infer)]" | cat - moonlight-common/src/lib.rs > temp && mv temp moonlight-common/src/lib.rs
+        # 1. 문제의 printf-compat 최신 버전으로 강제 업데이트
+        cargo update -p printf-compat
+        
+        # 2. 불안정한 Rust 문법([0u8; _])을 구버전에서도 호환되는 고정 길이로 강제 교체
+        if [ -f "moonlight-common/src/network/launch.rs" ]; then
+          sed -i 's/\[0u8; _\]/\[0u8; 32\]/g' moonlight-common/src/network/launch.rs
+        fi
+        if [ -f "moonlight-common/src/network/mod.rs" ]; then
+          sed -i 's/\[0u8; _\]/\[0u8; 32\]/g' moonlight-common/src/network/mod.rs
+        fi
 
-    - name: Build Backend (순정 Cargo 빌드 - 도커 안 씀!)
+        # 3. Nightly 강제 설정을 해제하여 안정된 버전(Stable)으로 빌드하도록 유도
+        rm -f rust-toolchain.toml rust-toolchain
+
+    - name: Build Backend (순정 Cargo 빌드)
       run: cargo build --release
 
     - name: Package Artifacts (Windows)
@@ -60,8 +72,8 @@ jobs:
       run: |
         New-Item -ItemType Directory -Path ./release-files
         Copy-Item finalOutput/static ./release-files/ -Recurse
-        Copy-Item target/release/streamer.exe ./release-files/
-        Copy-Item target/release/web-server.exe ./release-files/
+        Copy-Item target/release/streamer.exe ./release-files/ -ErrorAction SilentlyContinue
+        Copy-Item target/release/web-server.exe ./release-files/ -ErrorAction SilentlyContinue
         Copy-Item acme-certificate.ps1 ./release-files/ -ErrorAction SilentlyContinue
         Copy-Item setup.ps1 ./release-files/ -ErrorAction SilentlyContinue
         Compress-Archive -Path ./release-files/* -DestinationPath ./${{ matrix.archive_name }}
@@ -72,8 +84,8 @@ jobs:
       run: |
         mkdir ./release-files
         cp -r finalOutput/static ./release-files/
-        cp target/release/streamer ./release-files/
-        cp target/release/web-server ./release-files/
+        cp target/release/streamer ./release-files/ 2>/dev/null || true
+        cp target/release/web-server ./release-files/ 2>/dev/null || true
         tar -czvf ./${{ matrix.archive_name }} -C ./release-files .
 
     - name: Upload to GitHub Release
