@@ -1,4 +1,5 @@
 import { Stream, StreamAudioDiagnostics } from "../stream/index.js"
+import { FreezeWatcher } from "../stream/freeze_watch.js"
 import { InputDiagnostics } from "../stream/input.js"
 import { Component } from "./index.js"
 
@@ -23,6 +24,10 @@ type WorkerDiagnosticsSnapshot = {
         minGapMs: number
         avgGapMs: number
         maxGapMs: number
+        drawLatencyAvgMs?: number
+        drawLatencyMaxMs?: number
+        drawOnArrival?: boolean
+        usingBitmapRenderer?: boolean
         videoElementMode?: boolean
     } | null
     canvasRendererEnabled: boolean
@@ -37,6 +42,7 @@ export class StreamStatsOverlay implements Component {
     private streamGetter: (() => Stream | null) | null = null
     private workerDiagnosticsGetter: (() => WorkerDiagnosticsSnapshot | null) | null = null
     private inputDiagnosticsGetter: (() => InputDiagnostics | null) | null = null
+    private freezeWatchGetter: (() => FreezeWatcher | null) | null = null
     private statsEnabledCallback: ((enabled: boolean) => void) | null = null
     private statsReportCallback: ((text: string) => void) | null = null
     // How often to push the full stats dump to the server's console while the
@@ -61,6 +67,8 @@ export class StreamStatsOverlay implements Component {
     private elNackPli = document.createElement("span")
     private elFreeze = document.createElement("span")
     private elFreezeDetail = document.createElement("span")
+    private elFreezeWatch = document.createElement("span")
+    private elFreezeWatchLast = document.createElement("span")
     private elAssembly = document.createElement("span")
     private elInput = document.createElement("span")
     private elAudioBitrate = document.createElement("span")
@@ -71,6 +79,7 @@ export class StreamStatsOverlay implements Component {
     private elAudioPipeline = document.createElement("span")
     private elWorkerAudio = document.createElement("span")
     private elWorkerVideo = document.createElement("span")
+    private elStatsCost = document.createElement("span")
 
     // Previous snapshot for delta calculations
     private prevTimestamp = 0
@@ -83,6 +92,7 @@ export class StreamStatsOverlay implements Component {
     private prevAudioMessagesReceived = 0
     private prevNackCount = 0
     private prevPliCount = 0
+    private prevFecPacketsReceived = 0
     private prevKeyFramesDecoded = 0
     private prevFramesDecoded = 0
     private prevTotalAssemblyTime = 0
@@ -120,6 +130,41 @@ export class StreamStatsOverlay implements Component {
         })
         this.root.appendChild(header)
 
+        // Copy button — the periodic server-log report is every 5 minutes
+        // (REPORT_INTERVAL_MS), too slow to grab a snapshot right after
+        // something interesting happens.
+        const copyRow = document.createElement("div")
+        copyRow.classList.add("stream-stats-row")
+        copyRow.style.textAlign = "center"
+        copyRow.style.justifyContent = "center"
+        // The overlay is pointer-events: none (so it never blocks touch/click
+        // input to the stream underneath) — re-enable it for the whole row,
+        // not just the button, so a touch that lands just outside the
+        // button's exact bounds (easy on a touchscreen) still hits something
+        // with pointer-events: auto instead of passing straight through.
+        copyRow.style.pointerEvents = "auto"
+        // Game input is captured via touchstart/touchend listeners on
+        // `document` (stream.ts addListeners()), which call preventDefault()
+        // unconditionally on every touch — that both suppresses the browser's
+        // synthetic click after a tap AND forwards the tap as in-game input.
+        // pointer-events:auto only fixes hit-testing; the touch event still
+        // bubbles through pointer-events:none ancestors to document
+        // regardless. Stopping propagation at the row (not just the button)
+        // catches taps that land in the row's padding too.
+        for (const eventName of ["touchstart", "touchend", "touchmove", "touchcancel"]) {
+            copyRow.addEventListener(eventName, (e) => e.stopPropagation())
+        }
+        const copyButton = document.createElement("button")
+        copyButton.textContent = "Copy Stats"
+        copyButton.style.cursor = "pointer"
+        copyButton.style.padding = "4px 14px"
+        copyButton.addEventListener("click", (e) => {
+            e.stopPropagation()
+            this.copyStatsToClipboard(copyButton)
+        })
+        copyRow.appendChild(copyButton)
+        this.root.appendChild(copyRow)
+
         const rows: Array<[string, HTMLSpanElement]> = [
             ["Resolution", this.elVideoRes],
             ["Codec", this.elCodec],
@@ -133,6 +178,8 @@ export class StreamStatsOverlay implements Component {
             ["NACK / PLI", this.elNackPli],
             ["Freeze", this.elFreeze],
             ["Freeze Detail", this.elFreezeDetail],
+            ["Freeze Watch", this.elFreezeWatch],
+            ["Watch Last", this.elFreezeWatchLast],
             ["Frame Assembly", this.elAssembly],
             ["Input", this.elInput],
             ["Audio Bitrate", this.elAudioBitrate],
@@ -143,6 +190,7 @@ export class StreamStatsOverlay implements Component {
             ["Audio Pipeline", this.elAudioPipeline],
             ["Worker Audio", this.elWorkerAudio],
             ["Worker Video", this.elWorkerVideo],
+            ["Stats Cost", this.elStatsCost],
         ]
 
         for (const [label, valueEl] of rows) {
@@ -178,6 +226,10 @@ export class StreamStatsOverlay implements Component {
 
     setInputDiagnosticsGetter(getter: () => InputDiagnostics | null) {
         this.inputDiagnosticsGetter = getter
+    }
+
+    setFreezeWatchGetter(getter: () => FreezeWatcher | null) {
+        this.freezeWatchGetter = getter
     }
 
     setStatsEnabledCallback(cb: (enabled: boolean) => void) {
@@ -217,11 +269,48 @@ export class StreamStatsOverlay implements Component {
         }
     }
 
-    /** Builds a plaintext dump of every currently-displayed stat and hands it to the report callback, if any. */
+    /** Plaintext dump of every currently-displayed stat, in row order. */
+    private buildStatsText(): string {
+        const lines = this.statRows.map(([label, valueEl]) => `${label}: ${valueEl.textContent}`)
+        return `[Stream Stats]\n${lines.join("\n")}`
+    }
+
+    /** Hands the current stats dump to the report callback, if any. */
     private reportStats() {
         if (!this.statsReportCallback) return
-        const lines = this.statRows.map(([label, valueEl]) => `${label}: ${valueEl.textContent}`)
-        this.statsReportCallback(`[Stream Stats]\n${lines.join("\n")}`)
+        this.statsReportCallback(this.buildStatsText())
+    }
+
+    /** Copies the current stats dump to the clipboard — an immediate
+     * alternative to the periodic (5-minute) server-log report. */
+    private async copyStatsToClipboard(button: HTMLButtonElement) {
+        const text = this.buildStatsText()
+        const original = button.textContent
+        try {
+            if (navigator.clipboard?.writeText) {
+                await navigator.clipboard.writeText(text)
+            } else {
+                throw new Error("Clipboard API unavailable")
+            }
+            button.textContent = "Copied!"
+        } catch {
+            // Fallback for browsers without navigator.clipboard (or denied
+            // permission, e.g. non-secure context): select a hidden textarea
+            // and use the legacy copy command.
+            const ta = document.createElement("textarea")
+            ta.value = text
+            ta.style.position = "fixed"
+            ta.style.opacity = "0"
+            document.body.appendChild(ta)
+            ta.select()
+            let copied = false
+            try {
+                copied = document.execCommand("copy")
+            } catch { /* ignore */ }
+            document.body.removeChild(ta)
+            button.textContent = copied ? "Copied!" : "Copy failed"
+        }
+        setTimeout(() => { button.textContent = original }, 1500)
     }
 
     isVisible(): boolean {
@@ -229,6 +318,7 @@ export class StreamStatsOverlay implements Component {
     }
 
     private statsProcessingMs: number = 0
+    private lastStatsWallMs: number = 0
     private updatePending = false
 
     private scheduleUpdate() {
@@ -276,6 +366,8 @@ export class StreamStatsOverlay implements Component {
         let audioMessagesReceived = 0
         let nackCount = 0
         let pliCount = 0
+        let fecPacketsReceived = 0
+        let fecPacketsDiscarded = 0
         let keyFramesDecoded = 0
         let freezeCount = 0
         let totalFreezesDuration = 0
@@ -301,6 +393,8 @@ export class StreamStatsOverlay implements Component {
                 packetsLost = report.packetsLost ?? 0
                 nackCount = report.nackCount ?? 0
                 pliCount = report.pliCount ?? 0
+                fecPacketsReceived = report.fecPacketsReceived ?? 0
+                fecPacketsDiscarded = report.fecPacketsDiscarded ?? 0
                 keyFramesDecoded = report.keyFramesDecoded ?? 0
                 freezeCount = report.freezeCount ?? 0
                 totalFreezesDuration = report.totalFreezesDuration ?? 0
@@ -348,7 +442,8 @@ export class StreamStatsOverlay implements Component {
             const nackDelta = nackCount - this.prevNackCount
             const pliDelta  = pliCount  - this.prevPliCount
             const keyDelta  = keyFramesDecoded - this.prevKeyFramesDecoded
-            this.elNackPli.textContent = `NACK ${Math.round(nackDelta / elapsed)}/s, PLI ${Math.round(pliDelta / elapsed)}/s, keyframes ${Math.round(keyDelta / elapsed)}/s (${keyFramesDecoded} total)`
+            const fecDelta  = fecPacketsReceived - this.prevFecPacketsReceived
+            this.elNackPli.textContent = `NACK ${Math.round(nackDelta / elapsed)}/s, PLI ${Math.round(pliDelta / elapsed)}/s, keyframes ${Math.round(keyDelta / elapsed)}/s (${keyFramesDecoded} total), FEC ${Math.round(fecDelta / elapsed)}/s (${fecPacketsReceived} rx, ${fecPacketsDiscarded} disc)`
 
             const assembledDelta = framesAssembledFromMultiplePackets - this.prevFramesAssembled
             const assemblyTimeDelta = totalAssemblyTime - this.prevTotalAssemblyTime
@@ -434,6 +529,25 @@ export class StreamStatsOverlay implements Component {
             ? `avg ${avgFreezeDurationMs} ms, cause: ${freezeCause} | jitter: ${this.freezeCorrelationJitterSpikes}/${freezeCount}, rx-drop: ${this.freezeCorrelationReceiveDrop}/${freezeCount}, gp-poll: ${this.freezeCorrelationSlowGpPoll}/${freezeCount}`
             : `—`
 
+        // FreezeWatcher (always-on forensics) — per-event cause attribution,
+        // including render stalls the inbound-rtp freezeCount can't see.
+        const freezeWatcher = this.freezeWatchGetter?.() ?? null
+        if (freezeWatcher) {
+            this.elFreezeWatch.textContent = freezeWatcher.getSummaryLine()
+            this.elFreezeWatchLast.textContent = freezeWatcher.getLastEventLine()
+        } else {
+            this.elFreezeWatch.textContent = "—"
+            this.elFreezeWatchLast.textContent = "—"
+        }
+
+        // Instrumentation self-cost, measured on-device: how much the stats
+        // machinery itself spends (answering "is the logging slowing us down"
+        // with numbers instead of assumptions). getStats wall time is mostly
+        // off-main-thread; proc is the main-thread share.
+        this.elStatsCost.textContent =
+            `overlay proc ${this.statsProcessingMs.toFixed(1)} ms + getStats ${this.lastStatsWallMs.toFixed(1)} ms wall @0.5Hz` +
+            `; watcher: ${freezeWatcher?.getSelfCostLine() ?? "—"}`
+
         this.elVideoRes.textContent = videoWidth > 0 ? `${videoWidth}×${videoHeight}` : "—"
         this.elCodec.textContent = codec || "—"
         this.elFps.textContent = framesPerSecond > 0 ? `${framesPerSecond}` : "—"
@@ -456,8 +570,12 @@ export class StreamStatsOverlay implements Component {
         const jbMinDelta     = jitterBufferMinimumDelay - this.prevJitterBufferMinimumDelay
         const avgJbDelayMs   = jbEmittedDelta > 0 ? (jbDelayDelta / jbEmittedDelta * 1000) : -1
         const floorJbMs      = jbEmittedDelta > 0 ? (jbMinDelta / jbEmittedDelta * 1000) : -1
+        const jbDiag = this.streamGetter?.()?.getJitterBufferDiagnostics()
+        const jbTargetStr = jbDiag
+            ? `, target ${jbDiag.currentMs}ms${jbDiag.elevated ? ` (raised from ${jbDiag.floorMs}ms)` : ""}`
+            : ""
         this.elJitter.textContent = jitter > 0
-            ? `net ${(jitter * 1000).toFixed(1)} ms, buf avg ${avgJbDelayMs >= 0 ? avgJbDelayMs.toFixed(1) : "?"} ms (floor ${floorJbMs >= 0 ? floorJbMs.toFixed(1) : "?"} ms)`
+            ? `net ${(jitter * 1000).toFixed(1)} ms, buf avg ${avgJbDelayMs >= 0 ? avgJbDelayMs.toFixed(1) : "?"} ms (floor ${floorJbMs >= 0 ? floorJbMs.toFixed(1) : "?"} ms)${jbTargetStr}`
             : "\u2014"
 
         const stream = this.streamGetter?.()
@@ -485,10 +603,15 @@ export class StreamStatsOverlay implements Component {
             if (workerDiag.canvasRendererEnabled) {
                 if (workerDiag.canvas) {
                     const c = workerDiag.canvas
-                    const modeLabel = c.videoElementMode ? "vidElem" : (c.active ? "worker" : "main")
+                    const modeLabel = c.videoElementMode ? "vidElem" : (c.active ? "worker" : (c.usingBitmapRenderer ? "main-bitmap" : "main-2d"))
                     const dropLabel = c.active ? "dropped" : "rafMiss"
                     const gapStr = c.minGapMs >= 0
                         ? `, gaps: ${c.minGapMs.toFixed(1)}/${c.avgGapMs.toFixed(1)}/${c.maxGapMs.toFixed(1)} ms`
+                        : ""
+                    // Arrival→draw latency: the A/B readout for the
+                    // draw-on-arrival setting (~0ms on-arrival, ~8ms avg rAF)
+                    const latStr = (c.drawLatencyAvgMs ?? -1) >= 0
+                        ? `, lat: ${c.drawLatencyAvgMs!.toFixed(1)}/${(c.drawLatencyMaxMs ?? -1).toFixed(1)} ms (${c.drawOnArrival ? "on-arrival" : "raf"})`
                         : ""
                     const srcGapStr = (c as any).srcGapMs ? `, src: ${(c as any).srcGapMs} ms` : ""
                     const supersededStr = c.supersededCount > 0 ? `, skip=${c.supersededCount}` : ""
@@ -504,7 +627,7 @@ export class StreamStatsOverlay implements Component {
                         arrivedRate = elapsed > 0 ? Math.round((c.arrivedCount - this.prevCanvasArrivedCount) / elapsed) : 0
                         this.prevCanvasArrivedCount = c.arrivedCount
                     }
-                    this.elWorkerVideo.textContent = `mode=${modeLabel}, arrived=${arrivedRate}/s, drawn=${c.drawnFrameCount}, ${dropLabel}=${c.rafMissedFrames}${supersededStr}${jumpsStr}${gapStr}${srcGapStr}, err=${c.error ?? "none"}`
+                    this.elWorkerVideo.textContent = `mode=${modeLabel}, arrived=${arrivedRate}/s, drawn=${c.drawnFrameCount}, ${dropLabel}=${c.rafMissedFrames}${supersededStr}${jumpsStr}${gapStr}${latStr}${srcGapStr}, err=${c.error ?? "none"}`
                 } else {
                     this.elWorkerVideo.textContent = "canvas diagnostics unavailable"
                 }
@@ -526,6 +649,7 @@ export class StreamStatsOverlay implements Component {
         this.prevAudioMessagesReceived = audioMessagesReceived
         this.prevNackCount = nackCount
         this.prevPliCount = pliCount
+        this.prevFecPacketsReceived = fecPacketsReceived
         this.prevKeyFramesDecoded = keyFramesDecoded
         this.prevFramesDecoded = framesDecoded
         this.prevTotalAssemblyTime = totalAssemblyTime

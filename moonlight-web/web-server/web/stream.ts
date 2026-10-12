@@ -12,10 +12,15 @@ import { getStandardVideoFormats, getSupportedVideoFormats } from "./stream/vide
 import { CanvasRenderer } from "./stream/canvas.js";
 import { StreamCapabilities, StreamKeys } from "./api_bindings.js";
 import { getTeslaVirtualSwapOverride, setTeslaVirtualSwapOverride } from "./stream/gamepad.js";
-import { KeyboardModeEvent, ScreenKeyboard, TextEvent } from "./screen_keyboard.js";
+import { KeyboardModeEvent, KeyboardModeWillChangeEvent, ScreenKeyboard, TextEvent } from "./screen_keyboard.js";
 import { requestKeyboardLock } from "./iframe.js";
 import { FormModal } from "./component/modal/form.js";
 import { StreamStatsOverlay } from "./component/stream_stats.js";
+import { FreezeWatcher } from "./stream/freeze_watch.js";
+
+/** Minimum visualViewport shrink (px) that counts as "an on-screen keyboard
+ * opened" rather than a URL bar collapsing or a rounding wobble. */
+const KEYBOARD_VIEWPORT_SHRINK_MIN_PX = 80
 
 function getBuildVersionTag(): string {
     try {
@@ -62,8 +67,45 @@ async function startApp() {
     }
 
     // Start and Mount App
-    const app = new ViewerApp(api, hostId, appId)
+    const app = new ViewerApp(api, hostId, appId, parseSettingsFromQuery(queryParams))
     app.mount(rootElement)
+}
+
+/**
+ * Launch-time stream setting overrides, so a launcher/bookmark can pin a
+ * config without touching the saved per-host settings. Ported from upstream
+ * 55391a9; the key set is mapped onto our StreamSettings schema.
+ *
+ * e.g. stream.html?hostId=1&appId=2&bitrate=8000&fps=60&videoSize=1080p
+ */
+function parseSettingsFromQuery(queryParams: URLSearchParams): Partial<StreamSettings> {
+    const settings: Partial<StreamSettings> = {}
+
+    const bitrate = queryParams.get("bitrate")
+    if (bitrate && Number.isFinite(Number(bitrate))) {
+        settings.bitrate = Number(bitrate)
+    }
+
+    const fps = queryParams.get("fps")
+    if (fps && Number.isFinite(Number(fps))) {
+        settings.fps = Number(fps)
+    }
+
+    const videoSize = queryParams.get("videoSize")
+    if (videoSize) {
+        settings.videoSize = videoSize as StreamSettings["videoSize"]
+    }
+
+    const width = queryParams.get("videoSizeCustom.width")
+    const height = queryParams.get("videoSizeCustom.height")
+    if (width && height && Number.isFinite(Number(width)) && Number.isFinite(Number(height))) {
+        settings.videoSizeCustom = {
+            width: Number(width),
+            height: Number(height),
+        }
+    }
+
+    return settings
 }
 
 // Prevent starting transition
@@ -91,6 +133,8 @@ class ViewerApp implements Component {
     private canvasRenderer: CanvasRenderer | null = null
     private settings: StreamSettings
     private statsOverlay: StreamStatsOverlay
+    private freezeWatcher: FreezeWatcher | null = null
+    private freezeWatchContextSent = false
 
     private streamerSize: [number, number]
 
@@ -101,12 +145,17 @@ class ViewerApp implements Component {
     
     private wakeLock: WakeLockSentinel | null = null
     private hasInteracted = false
+    private audioStuckBadge: HTMLButtonElement | null = null
+    private audioStuckMonitorId: ReturnType<typeof setInterval> | null = null
+    private audioStuckSeconds = 0
     private cachedStreamRect: DOMRect | null = null
+    private keyboardViewportBaselineHeight: number | null = null
+    private streamVideoOffsetPx: number = 0
     private pollRafId: number | null = null
     private pollTimerId: ReturnType<typeof setTimeout> | null = null
     private pollLoopRunning: boolean = false
 
-    constructor(api: Api, hostId: number, appId: number) {
+    constructor(api: Api, hostId: number, appId: number, overrides?: Partial<StreamSettings>) {
         this.api = api
 
         // Bind update loops
@@ -118,7 +167,17 @@ class ViewerApp implements Component {
         setSidebar(this.sidebar)
 
         // Configure stream
-        const settings = getLocalStreamSettings(hostId) ?? defaultStreamSettings()
+        const storedSettings = getLocalStreamSettings(hostId) ?? defaultStreamSettings()
+        // Query-string overrides win over the saved settings, but are not
+        // persisted — they only apply to this launch.
+        const settings: StreamSettings = {
+            ...storedSettings,
+            ...overrides,
+            videoSizeCustom: {
+                ...storedSettings.videoSizeCustom,
+                ...overrides?.videoSizeCustom,
+            },
+        }
 
         let browserWidth = Math.max(document.documentElement.clientWidth || 0, window.innerWidth || 0)
         let browserHeight = Math.max(document.documentElement.clientHeight || 0, window.innerHeight || 0)
@@ -128,8 +187,6 @@ class ViewerApp implements Component {
 
         // Create stats overlay early (before startStream which uses it async)
         this.statsOverlay = new StreamStatsOverlay()
-
-        this.startStream(hostId, appId, settings, [browserWidth, browserHeight])
 
         this.streamerSize = getStreamerSize(settings, [browserWidth, browserHeight])
 
@@ -153,7 +210,7 @@ class ViewerApp implements Component {
         if(this.settings.canvasRenderer) {
             this.canvasElement.classList.add("video-stream")
             this.div.appendChild(this.canvasElement)
-            this.canvasRenderer = new CanvasRenderer(this.canvasElement, settings.stretchToFit, settings.useVideoWorker)
+            this.canvasRenderer = new CanvasRenderer(this.canvasElement, settings.stretchToFit, settings.useVideoWorker, settings.drawOnArrival)
             this.videoElement.autoplay = false
         }
 
@@ -179,6 +236,16 @@ class ViewerApp implements Component {
         // to reflow from its initial min-width/min-height square into the correct ratio)
         new ResizeObserver(() => { this.cachedStreamRect = null }).observe(this.videoElement)
 
+        // Drive the on-screen-keyboard viewport adjustment. Upstream polls this
+        // from a permanent rAF loop; visualViewport events are the actual signal
+        // and cost nothing on the (overwhelmingly common) path where the
+        // keyboard never opens.
+        if (window.visualViewport) {
+            const onViewportChange = () => this.updateKeyboardViewportVideoOffset()
+            window.visualViewport.addEventListener("resize", onViewportChange)
+            window.visualViewport.addEventListener("scroll", onViewportChange)
+        }
+
         window.addEventListener("gamepadconnected", this.onGamepadConnect.bind(this))
         window.addEventListener("gamepaddisconnected", this.onGamepadDisconnect.bind(this))
         // Connect all gamepads
@@ -187,6 +254,15 @@ class ViewerApp implements Component {
                 this.onGamepadAdd(gamepad)
             }
         }
+
+        // Started last: startStream is async and un-awaited, and its
+        // synchronous portion (up to statsOverlay.show()) reads
+        // this.canvasRenderer via the stats-enabled callback. Firing it
+        // before canvasRenderer is assigned above meant that callback always
+        // ran against null — worker-mode stats collection silently never
+        // turned on (2026-07-20 field report: worker stats stuck at all
+        // zeros forever, video otherwise playing fine).
+        this.startStream(hostId, appId, settings, [browserWidth, browserHeight])
     }
     private addListeners(element: GlobalEventHandlers) {
         element.addEventListener("keydown", this.onKeyDown.bind(this), { passive: false })
@@ -236,6 +312,26 @@ class ViewerApp implements Component {
             this.statsOverlay.show()
         }
 
+        // Freeze forensics: runs for the whole session (independent of the
+        // stats overlay) and attributes every freeze — decoder-side gaps AND
+        // main-thread render stalls — then reports each event to the server
+        // console via ClientLog and to the stats overlay.
+        this.freezeWatcher = new FreezeWatcher(() => this.stream?.getPeer() ?? null)
+        this.freezeWatcher.setAudioDiagnosticsGetter(() => this.stream?.getAudioDiagnostics() ?? null)
+        this.freezeWatcher.setAudioStatsPoller(() => this.stream?.requestAudioWorkletStats())
+        this.freezeWatcher.onEvent((event, summary) => {
+            this.sendFreezeWatchContext()
+            if (event.kind === "video-freeze") {
+                this.stream?.notifyFreezeEvent(event.cause)
+            }
+            this.stream?.sendClientLogMessage(
+                `[FreezeWatch] +${(event.atMs / 1000).toFixed(1)}s ${event.kind} ` +
+                `${Math.round(event.durationMs)}ms cause=${event.cause} | ${event.detail} ` +
+                `| totals: ${summary.videoFreezes} video / ${summary.renderStalls} render`
+            )
+        })
+        this.statsOverlay.setFreezeWatchGetter(() => this.freezeWatcher)
+
         // Add app info listener
         this.stream.addInfoListener(this.onInfo.bind(this))
 
@@ -281,6 +377,13 @@ class ViewerApp implements Component {
             document.title = `Stream: ${app.title}`
         } else if (data.type == "connectionComplete") {
             this.sidebar.onCapabilitiesChange(data.capabilities)
+            this.freezeWatcher?.start()
+            // Log the settings header even for sessions that never freeze —
+            // otherwise clean A/B runs leave no record of what they tested.
+            this.sendFreezeWatchContext()
+            this.startAudioStuckMonitor()
+        } else if (data.type == "connectionTerminated" || data.type == "error") {
+            this.freezeWatcher?.stop()
         } else if (data.type == "videoTrack") {
             if (this.canvasRenderer) {
                 this.canvasRenderer.setVideoTrack(data.track)
@@ -288,6 +391,81 @@ class ViewerApp implements Component {
         } else if (data.type == "inputClientsChanged") {
             this.sidebar.onInputClientsChanged(data.count)
         }
+    }
+
+    /**
+     * One-time settings header for the FreezeWatch log so every field session
+     * is self-describing (the #1 question when reading a freeze log is "which
+     * settings?"). Sent at connectionComplete AND lazily before the first
+     * event, whichever comes first.
+     */
+    private sendFreezeWatchContext() {
+        if (this.freezeWatchContextSent) return
+        this.freezeWatchContextSent = true
+        const s = this.settings
+        this.stream?.sendClientLogMessage(
+            `[FreezeWatch] session: ${this.streamerSize[0]}x${this.streamerSize[1]}@${s.fps} ` +
+            `bitrate=${s.bitrate}kbps jitterBuffer=${s.jitterBufferMs}ms fec=${s.videoFec} ` +
+            `canvas=${s.canvasRenderer} videoWorker=${s.useVideoWorker} audioWorker=${s.useAudioWorker} ` +
+            `build=${getBuildVersionTag()}`
+        )
+        // Full settings dump for remote review — the summary line above only
+        // carries the usual suspects, and every field session so far has had
+        // a "wait, which settings was that?" moment.
+        try {
+            this.stream?.sendClientLogMessage(`[FreezeWatch] settings: ${JSON.stringify(s)}`)
+        } catch {
+            // settings should always be plain JSON-serializable data; a dump
+            // failure must never break the stream
+        }
+    }
+
+    /**
+     * "Tap to unmute" badge: once the platform suspends the AudioContext,
+     * programmatic resume() is gated behind a user gesture (Tesla enforces
+     * this — 2026-07-19 field session: resume() was retried ~50x/s for the
+     * whole silent period and denied every time). A tap is the only cure, so
+     * when audio has been stuck non-running for a few seconds, say so
+     * instead of leaving the user to discover tapping by accident.
+     */
+    private startAudioStuckMonitor() {
+        if (this.audioStuckMonitorId) return
+        this.audioStuckMonitorId = setInterval(() => {
+            const state = this.stream?.getAudioDiagnostics().audioContextState
+            const stuck = state === "suspended" || state === "interrupted"
+            this.audioStuckSeconds = stuck ? this.audioStuckSeconds + 1 : 0
+            if (this.audioStuckSeconds >= 3) {
+                this.showAudioStuckBadge()
+            } else if (!stuck) {
+                this.hideAudioStuckBadge()
+            }
+        }, 1000)
+    }
+
+    private showAudioStuckBadge() {
+        if (this.audioStuckBadge) return
+        const badge = document.createElement("button")
+        badge.innerText = "🔇 Tap to unmute"
+        badge.style.cssText =
+            "position:fixed;top:16px;left:50%;transform:translateX(-50%);z-index:1000;" +
+            "padding:10px 22px;border:1px solid rgba(100,200,255,0.6);border-radius:999px;" +
+            "background:rgba(0,0,0,0.65);color:white;font-size:16px;cursor:pointer;"
+        const unmute = (event: Event) => {
+            event.preventDefault()
+            event.stopPropagation()
+            // The tap itself is the user gesture resume() needs
+            this.stream?.resumeAudio()
+        }
+        badge.addEventListener("click", unmute)
+        badge.addEventListener("touchend", unmute)
+        ;(document.getElementById("root") ?? document.body).appendChild(badge)
+        this.audioStuckBadge = badge
+    }
+
+    private hideAudioStuckBadge() {
+        if (!this.audioStuckBadge) return
+        this.audioStuckBadge.remove()
+        this.audioStuckBadge = null
     }
 
     private focusInput() {
@@ -705,6 +883,109 @@ class ViewerApp implements Component {
     }
 
 
+    // -- On-screen keyboard viewport adjustment
+    //
+    // Ported from upstream a7631c3 + ed51100. Two deliberate deviations: upstream
+    // drives this from a permanent rAF loop and keys the geometry off their
+    // local-cursor position. This fork has neither, so it runs off visualViewport
+    // events (the actual signal, and free when the keyboard never opens) and uses
+    // upstream's non-local-cursor geometry from ed51100.
+    onScreenKeyboardModeWillChange(event: KeyboardModeWillChangeEvent) {
+        if (event.detail.enabled) {
+            this.captureKeyboardViewportBaseline()
+        }
+    }
+
+    private captureKeyboardViewportBaseline() {
+        // Sampled before the keyboard opens, so the shrink is measured against
+        // the un-obscured viewport.
+        this.keyboardViewportBaselineHeight = window.visualViewport?.height ?? null
+        this.setStreamVideoOffset(0)
+        this.resetKeyboardFloatingButtonPosition()
+    }
+    resetKeyboardViewportVideoOffset() {
+        this.keyboardViewportBaselineHeight = null
+        this.setStreamVideoOffset(0)
+        this.resetKeyboardFloatingButtonPosition()
+    }
+    private updateKeyboardViewportVideoOffset() {
+        const screenKeyboard = this.sidebar.getScreenKeyboard()
+        const visualViewport = window.visualViewport
+        const baselineHeight = this.keyboardViewportBaselineHeight
+
+        if (!screenKeyboard.isVisible() || !visualViewport || baselineHeight == null) {
+            if (this.streamVideoOffsetPx != 0 && !screenKeyboard.isVisible()) {
+                this.resetKeyboardViewportVideoOffset()
+            }
+            return
+        }
+
+        // Anything smaller than this is the URL bar or a rounding wobble, not a
+        // keyboard.
+        //
+        // On a browser whose on-screen keyboard overlays the page WITHOUT
+        // resizing the viewport — the Tesla browser is believed to be one — the
+        // shrink is always 0 and this whole adjustment stays inert. That is the
+        // correct outcome: nothing reports where the keyboard is, so there is
+        // nothing safe to move. Note this gates the floating button too: a
+        // visualViewport resize from some unrelated cause (rotation, window
+        // resize) must NOT park the hide-keyboard button at the bottom of the
+        // screen, where an overlay keyboard would swallow it.
+        const viewportShrink = baselineHeight - visualViewport.height
+        if (viewportShrink < KEYBOARD_VIEWPORT_SHRINK_MIN_PX) {
+            this.setStreamVideoOffset(0)
+            this.resetKeyboardFloatingButtonPosition()
+            return
+        }
+
+        this.updateKeyboardFloatingButtonPosition(visualViewport)
+
+        const streamRect = this.getStreamRect()
+        if (streamRect.width <= 0 || streamRect.height <= 0) {
+            return
+        }
+
+        // Only meaningful when the picture is shorter than the visible band —
+        // i.e. there is slack to lift it into. A stretched full-viewport canvas
+        // has none, so this correctly leaves it alone.
+        const slack = visualViewport.height - streamRect.height
+        if (slack > 0) {
+            this.setStreamVideoOffset(visualViewport.offsetTop - slack)
+        }
+    }
+    private setStreamVideoOffset(offsetPx: number) {
+        const next = Math.abs(offsetPx) < 0.5 ? 0 : offsetPx
+        if (next === this.streamVideoOffsetPx) {
+            return
+        }
+        // Ignore sub-pixel churn while the keyboard animates, but always honour
+        // a reset back to zero.
+        if (next !== 0 && Math.abs(next - this.streamVideoOffsetPx) < 1) {
+            return
+        }
+
+        this.streamVideoOffsetPx = next
+        if (next === 0) {
+            document.documentElement.style.removeProperty("--stream-video-offset")
+        } else {
+            document.documentElement.style.setProperty("--stream-video-offset", `${next}px`)
+        }
+
+        // The element moves without resizing, so neither the resize listener nor
+        // the ResizeObserver fires. Drop the cached rect by hand, or every touch
+        // and mouse coordinate stays mapped to the old position.
+        this.cachedStreamRect = null
+    }
+    /** Caller must have confirmed a keyboard-sized viewport shrink first. */
+    private updateKeyboardFloatingButtonPosition(visualViewport: VisualViewport) {
+        const bottomInset = Math.min(16, visualViewport.height * 0.08)
+        const buttonTop = visualViewport.offsetTop + visualViewport.height - bottomInset
+        document.documentElement.style.setProperty("--stream-keyboard-button-top", `${buttonTop}px`)
+    }
+    private resetKeyboardFloatingButtonPosition() {
+        document.documentElement.style.removeProperty("--stream-keyboard-button-top")
+    }
+
     mount(parent: HTMLElement): void {
         parent.appendChild(this.div)
     }
@@ -1066,7 +1347,13 @@ class ViewerSidebar implements Component, Sidebar {
 
         this.floatingKeyboardButton.innerText = "\u2328\u00d7"
         this.floatingKeyboardButton.title = "Hide Keyboard"
-        this.floatingKeyboardButton.style.cssText = "position:fixed;top:50%;right:12px;transform:translateY(-50%);width:44px;height:44px;z-index:1000;display:none;align-items:center;justify-content:center;border:1px solid rgba(100,200,255,0.6);border-radius:999px;background:rgba(0,0,0,0.55);color:white;font-size:18px;opacity:0.78;cursor:pointer;"
+        // --stream-keyboard-button-top is set by ViewerApp while the keyboard is
+        // up, parking the button just above it instead of at mid-screen. The
+        // -100% translate makes that value the button's bottom edge.
+        // margin:0 overrides the global `button { margin: 8px }` — for a fixed
+        // element `top`/`right` offset the MARGIN edge, so without this the
+        // button lands 8px low and 20px in from the right instead of 12px.
+        this.floatingKeyboardButton.style.cssText = "position:fixed;margin:0;top:var(--stream-keyboard-button-top,50%);right:12px;transform:translateY(-100%);width:44px;height:44px;z-index:1000;display:none;align-items:center;justify-content:center;border:1px solid rgba(100,200,255,0.6);border-radius:999px;background:rgba(0,0,0,0.55);color:white;font-size:18px;opacity:0.78;cursor:pointer;"
         const hideKeyboard = (event: Event) => {
             event.preventDefault()
             event.stopPropagation()
@@ -1079,6 +1366,7 @@ class ViewerSidebar implements Component, Sidebar {
         this.screenKeyboard.addKeyDownListener(this.onKeyDown.bind(this))
         this.screenKeyboard.addKeyUpListener(this.onKeyUp.bind(this))
         this.screenKeyboard.addTextListener(this.onText.bind(this))
+        this.screenKeyboard.addKeyboardModeWillChangeListener(this.app.onScreenKeyboardModeWillChange.bind(this.app))
         this.screenKeyboard.addKeyboardModeListener(this.onKeyboardModeChange.bind(this))
         this.div.appendChild(this.screenKeyboard.getHiddenElement())
 
@@ -1255,6 +1543,7 @@ class ViewerSidebar implements Component, Sidebar {
             this.floatingKeyboardButton.style.display = "flex"
         } else {
             this.floatingKeyboardButton.style.display = "none"
+            this.app.resetKeyboardViewportVideoOffset()
         }
     }
 
